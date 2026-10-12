@@ -96,14 +96,22 @@ public class OrderService {
      * failed, or the provider processed a refund whose response timed out and
      * surfaced as a PaymentException, so the transaction rolled back and the order
      * is still PAID — is deduplicated by the provider, through the idempotency key
-     * {@code "order-" + id + "-v" + version}. A rolled-back attempt leaves the row
-     * at the version it was loaded at, so the retry loads that same version and
-     * reproduces the same key, and the provider sees one refund rather than two.
-     * Had the cancellation instead committed, the retry short-circuits on the
-     * already-CANCELLED early return above and never refunds at all. The key is
-     * therefore read off the loaded entity <em>before</em> the flush below, which
-     * increments the in-memory version; using the post-flush version, a timestamp
-     * or a random UUID would mint a fresh key per attempt and refund twice.
+     * {@code "order-" + id + "-" + createdAt.toEpochMilli()}. Both components are
+     * immutable, so the retry reloads the same order and reproduces the same key
+     * no matter what was written to the row in between, and the provider sees one
+     * refund rather than two. Had the cancellation instead committed, the retry
+     * short-circuits on the already-CANCELLED early return above and never refunds
+     * at all. Note which timestamp carries this: the order's <em>creation</em>
+     * timestamp is fixed per order and is exactly what makes the key stable, while
+     * a per-<em>attempt</em> timestamp — or a random UUID, or any mutable field
+     * such as the version — would mint a fresh key per attempt and refund twice.
+     *
+     * <p>One hole the key cannot close: if an attempt rolls back to PAID after the
+     * provider actually processed the refund, and someone PATCHes
+     * {@code PAID -> SHIPPED} (an allowed edge) before the client retries, the
+     * retry 409s, the order ships, and the processed refund is never reconciled —
+     * nothing re-derives the key in that window. Real money can be lost here; it
+     * needs reconciliation outside this method, not a different key.
      *
      * <p>The ordering below is load-bearing. The save is flushed <em>before</em>
      * the refund because the flush issues
@@ -133,9 +141,17 @@ public class OrderService {
         }
         boolean refundable = order.getStatus() == OrderStatus.PAID;
         BigDecimal amount = order.getAmount();
-        // Read before the flush: saveAndFlush increments the in-memory version,
-        // so taking it afterwards would give a retry a different key.
-        String idempotencyKey = "order-" + id + "-v" + order.getVersion();
+        // Derived from two immutable facts about the order, so every retry of the
+        // same logical cancellation reproduces it whatever happened to the row in
+        // between: createdAt is @CreationTimestamp and non-updatable, and the key
+        // depends on no mutable field, so a future write path that touches a PAID
+        // order (correcting a typo'd email, say) cannot split it into two keys and
+        // refund twice. The timestamp is what makes id enough: under
+        // ddl-auto: create-drop, IDENTITY restarts at 1 every boot, so "order-1"
+        // alone would let a later boot's unrelated order present a burnt key and
+        // have the provider replay the old success without moving any money.
+        // Position is not load-bearing — it sits by amount only for readability.
+        String idempotencyKey = "order-" + id + "-" + order.getCreatedAt().toEpochMilli();
         order.setStatus(OrderStatus.CANCELLED);
         order.setCancelledAt(Instant.now());
         order.setCancellationReason(reason);

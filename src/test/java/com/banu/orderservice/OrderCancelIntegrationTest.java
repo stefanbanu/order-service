@@ -125,6 +125,17 @@ class OrderCancelIntegrationTest {
         return repository.findById(Long.parseLong(id)).orElseThrow();
     }
 
+    /**
+     * The key the service must have derived, rebuilt from the order's own stored
+     * creation timestamp rather than from a hardcoded millis value: createdAt is
+     * assigned by @CreationTimestamp at insert, so the test cannot know it up
+     * front — but it is immutable, so reading it back afterwards yields exactly
+     * the value the service saw.
+     */
+    private String expectedRefundKey(String id) {
+        return "order-" + id + "-" + stored(id).getCreatedAt().toEpochMilli();
+    }
+
     @Test
     void cancelsANewOrderWithoutARequestBodyAndWithoutRefunding() throws Exception {
         String id = createOrder("{\"customerEmail\":\"bob@example.com\",\"amount\":42.50}");
@@ -158,11 +169,7 @@ class OrderCancelIntegrationTest {
         // eq(new BigDecimal("42.50")) would be scale-sensitive: BigDecimal.equals
         // treats 42.5 and 42.50 as different, so compare by value instead.
         assertThat(refundedAmountFor(id)).isEqualByComparingTo("42.50");
-        // v0, not v1: inside the class-level test transaction the PATCH to PAID is
-        // a managed-entity write that is never flushed on its own, so the version
-        // is still the one the INSERT assigned when the cancel reads it. The
-        // cancel's own flush then writes version 1 — after the key was taken.
-        assertThat(refundKeyFor(id)).isEqualTo("order-" + id + "-v0");
+        assertThat(refundKeyFor(id)).isEqualTo(expectedRefundKey(id));
     }
 
     @Test
@@ -180,7 +187,7 @@ class OrderCancelIntegrationTest {
         // early return, so the port is never reached a second time at all — the
         // key only has to dedupe retries of an attempt that rolled back.
         verify(paymentClient, times(1))
-                .refund(eq(Long.parseLong(id)), any(BigDecimal.class), eq("order-" + id + "-v0"));
+                .refund(eq(Long.parseLong(id)), any(BigDecimal.class), eq(expectedRefundKey(id)));
     }
 
     @Test
@@ -248,10 +255,11 @@ class OrderCancelIntegrationTest {
      * <p>The provider may well have processed the first refund and simply failed
      * to answer, so the rollback that leaves the order PAID is only half the
      * safety — the retry refunds again, and nothing on this side can tell it not
-     * to. The protection is that both attempts carry the <em>same</em> key: the
-     * rolled-back attempt left the row at the version it was loaded at, so the
-     * retry reloads that version and reproduces the key, and the provider folds
-     * the two calls into one refund.
+     * to. The protection is that both attempts carry the <em>same</em> key: it is
+     * derived from the order's id and its non-updatable creation timestamp, so the
+     * retry reloads the same two facts and reproduces the key whatever the first
+     * attempt wrote and rolled back, and the provider folds the two calls into one
+     * refund.
      *
      * <p>NOT_SUPPORTED for the same reason as its siblings: inside the shared test
      * transaction the service would only mark it rollback-only, the flushed
@@ -283,9 +291,10 @@ class OrderCancelIntegrationTest {
         assertThat(keys.get(1))
                 .as("the retry must reproduce the first attempt's key so the provider dedupes it")
                 .isEqualTo(keys.get(0));
-        // The rollback left the row at the version the first attempt loaded, so
-        // that version — not a post-flush or per-attempt one — is in both keys.
-        assertThat(keys).containsExactly("order-" + id + "-v1", "order-" + id + "-v1");
+        // And it is the order's own key, not merely two copies of something: id
+        // plus the creation timestamp still on the rolled-back row.
+        String expected = expectedRefundKey(id);
+        assertThat(keys).containsExactly(expected, expected);
 
         mockMvc.perform(get("/orders/" + id))
                 .andExpect(status().isOk())
@@ -351,10 +360,8 @@ class OrderCancelIntegrationTest {
                 .andExpect(jsonPath("$.status").value("CANCELLED"))
                 .andExpect(jsonPath("$.cancelledAt").exists());
         assertThat(refundedAmountFor(id)).isEqualByComparingTo("42.50");
-        // The alias delegates to cancel(), so it carries a key of the same shape.
-        // v0 for the same reason as its POST sibling: the unflushed PATCH to PAID
-        // leaves the version at the one the INSERT assigned.
-        assertThat(refundKeyFor(id)).isEqualTo("order-" + id + "-v0");
+        // The alias delegates to cancel(), so it carries the same key a POST would.
+        assertThat(refundKeyFor(id)).isEqualTo(expectedRefundKey(id));
     }
 
     /**

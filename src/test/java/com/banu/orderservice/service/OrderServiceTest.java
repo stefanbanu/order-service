@@ -45,6 +45,15 @@ class OrderServiceTest {
 
     private static final Instant CREATED_AT = Instant.parse("2026-10-12T10:00:00Z");
 
+    /**
+     * The epoch-millis of {@link #CREATED_AT}, written out as a literal so the
+     * expected keys below are unambiguous rather than re-derived with the same
+     * expression the production code uses. Fixtures set createdAt explicitly for
+     * the same reason: an Instant.now() fixture could only be asserted against
+     * itself.
+     */
+    private static final String KEY = "order-7-1791799200000";
+
     @Mock
     private OrderRepository repository;
 
@@ -71,6 +80,12 @@ class OrderServiceTest {
         return order;
     }
 
+    private static Order order(long id, OrderStatus status, String amount, Instant createdAt) {
+        Order order = order(id, status, amount);
+        order.setCreatedAt(createdAt);
+        return order;
+    }
+
     /** saveAndFlush hands back whatever it was given, like a real flush of a managed entity. */
     private void savesWhatItIsGiven() {
         given(repository.saveAndFlush(any(Order.class))).willAnswer(call -> call.getArgument(0));
@@ -79,7 +94,7 @@ class OrderServiceTest {
     /**
      * A flush as Hibernate performs it: the managed instance's @Version field is
      * bumped in memory, and that same instance comes back. Stubbing it this way is
-     * what makes the pre-flush key assertion below able to fail.
+     * what gives the version-independence assertion below something to prove.
      */
     private void flushBumpsTheVersion() {
         given(repository.saveAndFlush(any(Order.class))).willAnswer(call -> {
@@ -138,37 +153,40 @@ class OrderServiceTest {
 
         assertThat(cancelled.status()).isEqualTo(OrderStatus.CANCELLED);
         ArgumentCaptor<BigDecimal> amount = ArgumentCaptor.forClass(BigDecimal.class);
-        verify(paymentClient, times(1)).refund(eq(7L), amount.capture(), eq("order-7-v0"));
+        verify(paymentClient, times(1)).refund(eq(7L), amount.capture(), eq(KEY));
         assertThat(amount.getValue()).isEqualByComparingTo("42.50");
     }
 
     /**
      * The key is the whole point of the widened port: it is what lets the provider
      * fold a sequential retry into one refund, so its exact value is asserted
-     * rather than matched with anyString(). The fixture carries an explicit
-     * version so "order-7-v3" is unambiguous.
+     * rather than matched with anyString(). Both components are immutable facts
+     * about the order — its id and its creation timestamp — so the fixture's fixed
+     * createdAt makes the expected string exact.
      */
     @Test
-    void cancelOfAPaidOrderRefundsWithAnIdempotencyKeyOfItsIdAndVersion() {
-        Order stored = order(7L, OrderStatus.PAID, "42.50", 3L);
+    void cancelOfAPaidOrderRefundsWithAnIdempotencyKeyOfItsIdAndCreationTimestamp() {
+        Order stored = order(7L, OrderStatus.PAID, "42.50");
         given(repository.findById(7L)).willReturn(Optional.of(stored));
         savesWhatItIsGiven();
 
         service.cancel(7L, "fraud");
 
-        assertThat(capturedRefundKey(7L)).isEqualTo("order-7-v3");
+        assertThat(capturedRefundKey(7L))
+                .as("id plus the epoch-millis of %s", CREATED_AT)
+                .isEqualTo(KEY);
     }
 
     /**
-     * The key is read off the loaded entity <em>before</em> the flush, which
-     * increments the in-memory version. This is the assertion that fails if the
-     * derivation is ever moved below {@code saveAndFlush}: the flush here bumps 3
-     * to 4 exactly as Hibernate would, so a post-flush read would mint
-     * "order-7-v4" and a retry — which reloads the rolled-back row at version 3 —
-     * would send a different key and be refunded twice.
+     * The key carries no mutable component: the flush here bumps the version from
+     * 3 to 4 exactly as Hibernate would, and the key is the same either side of
+     * it. That is what the version-based key could not promise — any write path
+     * that left an order PAID while bumping its version would have split one
+     * logical cancellation into two keys and had the provider pay out twice. This
+     * fails if someone reintroduces a mutable component such as the version.
      */
     @Test
-    void cancelDerivesTheIdempotencyKeyFromThePreFlushVersion() {
+    void cancelDerivesAnIdempotencyKeyTheVersionBumpCannotChange() {
         Order stored = order(7L, OrderStatus.PAID, "42.50", 3L);
         given(repository.findById(7L)).willReturn(Optional.of(stored));
         flushBumpsTheVersion();
@@ -176,7 +194,58 @@ class OrderServiceTest {
         service.cancel(7L, "fraud");
 
         assertThat(stored.getVersion()).as("the flush must really have bumped the version").isEqualTo(4L);
-        assertThat(capturedRefundKey(7L)).isEqualTo("order-7-v3");
+        assertThat(capturedRefundKey(7L))
+                .as("the key must be the same whether read before or after the bump")
+                .isEqualTo(KEY);
+    }
+
+    /**
+     * The collision the creation timestamp exists to prevent. Under
+     * {@code ddl-auto: create-drop} with a per-boot database name, IDENTITY
+     * restarts at 1 every boot, so id alone is not unique across boots: an
+     * "order-1" key burnt by one boot's order would make a later boot's unrelated
+     * order 1 look like a replay, and a compliant provider would answer the old
+     * success without moving any money. Same id, different creation timestamp,
+     * therefore different key.
+     */
+    @Test
+    void ordersSharingAnIdButNotACreationTimestampGetDifferentRefundKeys() {
+        Instant firstBoot = Instant.parse("2025-01-01T00:00:00Z");
+        Instant secondBoot = Instant.parse("2026-10-12T12:34:56.789Z");
+        given(repository.findById(1L)).willReturn(
+                Optional.of(order(1L, OrderStatus.PAID, "42.50", firstBoot)),
+                Optional.of(order(1L, OrderStatus.PAID, "42.50", secondBoot)));
+        savesWhatItIsGiven();
+
+        service.cancel(1L, "fraud");
+        service.cancel(1L, "fraud");
+
+        ArgumentCaptor<String> keys = ArgumentCaptor.forClass(String.class);
+        verify(paymentClient, times(2)).refund(eq(1L), any(BigDecimal.class), keys.capture());
+        assertThat(keys.getAllValues())
+                .containsExactly("order-1-1735689600000", "order-1-1791808496789")
+                .doesNotHaveDuplicates();
+    }
+
+    /**
+     * The inverse of the test above, and the property a retry depends on: the same
+     * order always derives the same key. Two reloads of one order — what a retry
+     * after a rolled-back attempt sees — produce one key, so the provider folds the
+     * two calls into a single refund.
+     */
+    @Test
+    void reloadingTheSameOrderAlwaysDerivesTheSameRefundKey() {
+        given(repository.findById(7L)).willReturn(
+                Optional.of(order(7L, OrderStatus.PAID, "42.50")),
+                Optional.of(order(7L, OrderStatus.PAID, "42.50")));
+        savesWhatItIsGiven();
+
+        service.cancel(7L, "fraud");
+        service.cancel(7L, "fraud");
+
+        ArgumentCaptor<String> keys = ArgumentCaptor.forClass(String.class);
+        verify(paymentClient, times(2)).refund(eq(7L), any(BigDecimal.class), keys.capture());
+        assertThat(keys.getAllValues()).containsExactly(KEY, KEY);
     }
 
     /**
@@ -196,7 +265,7 @@ class OrderServiceTest {
 
         InOrder sequence = inOrder(repository, paymentClient);
         sequence.verify(repository).saveAndFlush(stored);
-        sequence.verify(paymentClient).refund(eq(7L), any(BigDecimal.class), eq("order-7-v0"));
+        sequence.verify(paymentClient).refund(eq(7L), any(BigDecimal.class), eq(KEY));
         sequence.verifyNoMoreInteractions();
     }
 
@@ -261,7 +330,7 @@ class OrderServiceTest {
                 .cause()
                 .isSameAs(provider);
 
-        verify(paymentClient, times(1)).refund(eq(7L), any(BigDecimal.class), eq("order-7-v0"));
+        verify(paymentClient, times(1)).refund(eq(7L), any(BigDecimal.class), eq(KEY));
     }
 
     /**
@@ -283,7 +352,7 @@ class OrderServiceTest {
         // A PATCH carries no reason, so there is none to record.
         assertThat(cancelled.cancellationReason()).isNull();
         ArgumentCaptor<BigDecimal> amount = ArgumentCaptor.forClass(BigDecimal.class);
-        verify(paymentClient, times(1)).refund(eq(7L), amount.capture(), eq("order-7-v0"));
+        verify(paymentClient, times(1)).refund(eq(7L), amount.capture(), eq(KEY));
         assertThat(amount.getValue()).isEqualByComparingTo("42.50");
         verify(repository).saveAndFlush(stored);
     }
@@ -295,13 +364,13 @@ class OrderServiceTest {
      */
     @Test
     void updateStatusToCancelledPassesTheSameIdempotencyKeyCancelWould() {
-        Order stored = order(7L, OrderStatus.PAID, "42.50", 3L);
+        Order stored = order(7L, OrderStatus.PAID, "42.50");
         given(repository.findById(7L)).willReturn(Optional.of(stored));
         savesWhatItIsGiven();
 
         service.updateStatus(7L, OrderStatus.CANCELLED);
 
-        assertThat(capturedRefundKey(7L)).isEqualTo("order-7-v3");
+        assertThat(capturedRefundKey(7L)).isEqualTo(KEY);
     }
 
     /**
@@ -347,7 +416,7 @@ class OrderServiceTest {
                 .cause()
                 .isSameAs(provider);
 
-        verify(paymentClient, times(1)).refund(eq(7L), any(BigDecimal.class), eq("order-7-v0"));
+        verify(paymentClient, times(1)).refund(eq(7L), any(BigDecimal.class), eq(KEY));
     }
 
     /**

@@ -9,7 +9,7 @@ All verified working on this machine (Java 25, `mvnw` → Maven 3.10.0).
 - Compile only: ./mvnw compile
 
 ```bash
-./mvnw test                                          # run all tests (100)
+./mvnw test                                          # run all tests (102)
 ./mvnw test -Dtest='OrderControllerTest'             # single test class
 ./mvnw test -Dtest='ClassName#methodName'            # single test method
 ./mvnw test -Dtest='Order*Test'                      # pattern
@@ -180,16 +180,29 @@ One resource so far:
     the duration of an external call; an outbox is the real fix, not reordering those lines.
   - A **sequential** retry is deduplicated by the idempotency key, not by the ordering. If
     the refund succeeds but the commit fails, the order stays `PAID` and the 502 invites a
-    retry — so `cancel` passes `PaymentClient.refund` a key of `order-{id}-v{version}`,
-    which the provider is contractually required to collapse into one refund.
-- **The idempotency key is read before the flush.** `saveAndFlush` increments the in-memory
-  version, so deriving the key afterwards would mint a different key per attempt and refund
-  twice — exactly what it exists to prevent. A rolled-back attempt leaves the row at the
-  version it was loaded at, so a retry reproduces the same key; a committed one short-circuits
-  on the already-`CANCELLED` early return and never refunds at all. A post-flush version, a
-  timestamp, or a random UUID all defeat it. `OrderServiceTest` pins this with a stub whose
-  `saveAndFlush` bumps the version the way Hibernate does, then asserts the key still carries
-  the pre-flush one.
+    retry — so `cancel` passes `PaymentClient.refund` a key of
+    `order-{id}-{createdAt epoch millis}`, which the provider is contractually required to
+    collapse into one refund.
+  - One window the key cannot close: if a rolled-back attempt's refund was in fact processed
+    and someone then PATCHes `PAID -> SHIPPED` (an allowed edge) before the client retries,
+    the retry 409s, the order ships, and the refund is never reconciled. Real money, and it
+    needs reconciliation outside `cancel`.
+- **The idempotency key is built only from immutable fields.** `id` and `createdAt`
+  (`@CreationTimestamp`, `@Column(updatable = false)`) are both unchangeable once the row
+  exists, which is what makes every retry of the same cancellation reproduce the key —
+  whatever happened to the row in between. Two consequences worth keeping:
+  - **No mutable component, ever.** The key used to carry `@Version`, which worked only
+    because no write path leaves an order in `PAID`. That is an unwritten invariant: the
+    first write that preserves `PAID` (a PATCH correcting a typo'd `customerEmail`, say)
+    would bump the version, mint a fresh key on retry, and pay out twice — silently.
+    `OrderServiceTest` pins this with a stub whose `saveAndFlush` bumps the version the way
+    Hibernate does, then asserts the key is **unchanged** by it.
+  - **`id` alone is not enough.** Under `create-drop` with a per-boot database name,
+    `IDENTITY` restarts at 1, so boot 2's order `1` would present the key boot 1's order `1`
+    already burned, and a provider honouring the contract would replay that old success —
+    moving no money and leaving a customer unpaid. The timestamp component is what rules that
+    out. Note any boot-scoped salt would fix the collision and *break* the retry case, where
+    the retry may arrive after a restart: the key has to be durable **and** per-order.
 - **A second cancel is a write-free 200.** The already-`CANCELLED` early return precedes
   every setter, so no `UPDATE` is issued, no second refund happens, and a `cancellationReason`
   set earlier is never nulled out by a later reason-less PATCH.
@@ -286,7 +299,7 @@ No profiles are defined — startup reports `No active profile set`.
 
 ## Testing
 
-100 tests in seven classes, layered deliberately:
+102 tests in seven classes, layered deliberately:
 
 | Class | Scope |
 | --- | --- |
