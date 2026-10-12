@@ -5,9 +5,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Commands
 
 All verified working on this machine (Java 25, `mvnw` → Maven 3.10.0).
+- Build + tests: ./mvnw verify
+- Compile only: ./mvnw compile
 
 ```bash
-./mvnw test                                          # run all tests (57)
+./mvnw test                                          # run all tests (96)
 ./mvnw test -Dtest='OrderControllerTest'             # single test class
 ./mvnw test -Dtest='ClassName#methodName'            # single test method
 ./mvnw test -Dtest='Order*Test'                      # pattern
@@ -61,6 +63,7 @@ gives a compile error, or silently nothing:
 | `...boot.test.autoconfigure.web.servlet.WebMvcTest` | `org.springframework.boot.webmvc.test.autoconfigure.WebMvcTest` |
 | `...boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc` | `org.springframework.boot.webmvc.test.autoconfigure.AutoConfigureMockMvc` |
 | `...boot.test.autoconfigure.orm.jpa.DataJpaTest` | `org.springframework.boot.data.jpa.test.autoconfigure.DataJpaTest` |
+| `...boot.test.autoconfigure.orm.jpa.TestEntityManager` | `org.springframework.boot.jpa.test.autoconfigure.TestEntityManager` — note this is **not** under `data.jpa` like `@DataJpaTest`; the two sit in different packages |
 | `...boot.web.embedded.tomcat.TomcatWebServer` | `org.springframework.boot.tomcat.TomcatWebServer` |
 | `@MockBean` | **removed.** Use `@MockitoBean` (`org.springframework.test.context.bean.override.mockito`) |
 | `com.fasterxml.jackson.databind.ObjectMapper` | `tools.jackson.databind.ObjectMapper` — Boot 4 ships **Jackson 3** under the `tools.jackson` root; the `com.fasterxml` databind is not on the classpath at all |
@@ -108,11 +111,17 @@ feature:
 controller/   OrderController          REST endpoints
 service/      OrderService             transactions, entity <-> DTO mapping
 repository/   OrderRepository          Spring Data JPA
-dto/          OrderRequest, OrderResponse, OrderStatusUpdateRequest
+dto/          OrderRequest, OrderResponse, OrderStatusUpdateRequest,
+              CancelOrderRequest
 entity/       Order, OrderStatus (owns the transition matrix)
 exception/    OrderNotFoundException, InvalidStatusTransitionException,
-              ApiExceptionHandler
+              RefundFailedException, ApiExceptionHandler
+client/       PaymentClient (outbound port), FakePaymentClient,
+              PaymentException, PaymentClientConfiguration
 ```
+
+`client/` is the one package that is not a layer: it holds an outbound port and its
+stand-in, not a tier of the request path.
 
 One resource so far:
 
@@ -121,7 +130,8 @@ One resource so far:
 | `POST /orders` | 201 + `Location: /orders/{id}`; 400 on invalid input |
 | `GET /orders/{id}` | 200, or 404 |
 | `GET /orders?email=` | 200; `email` is **optional** — omitted lists all orders |
-| `PATCH /orders/{id}/status` | 200 + updated order; 200 no-op if already in that status; 404 if unknown, 409 if the transition is not allowed, 400 if the status is missing or not a known name |
+| `PATCH /orders/{id}/status` | 200 + updated order; 200 no-op if already in that status; 404 if unknown, 409 if the transition is not allowed or the order was modified concurrently, 400 if the status is missing or not a known name, **502 if a refund failed** — `{"status":"CANCELLED"}` is an alias for the cancel endpoint, so this **can move money** |
+| `POST /orders/{id}/cancel` | 200 + updated order with `cancelledAt`/`cancellationReason`; refunds a `PAID` order; 200 no-op if already cancelled; 404 if unknown, 409 if `SHIPPED` or modified concurrently, 400 if the reason exceeds 255 chars or the body is unparseable, 502 if the refund failed |
 
 ### Invariants worth preserving
 
@@ -132,9 +142,9 @@ One resource so far:
   absence of `id`, `status` and `createdAt` is what makes them unsettable by a client.
   Posting them is silently ignored (Jackson is lenient about unknown properties), covered by
   tests in `OrderApiIntegrationTest`. Don't widen `OrderRequest` without re-reading those.
-- **`status` is server-set to `NEW` at creation** and only moves through
-  `PATCH /orders/{id}/status`. `OrderRequest` still has no `status` field, so a client
-  cannot pick the starting status.
+- **`status` is server-set to `NEW` at creation** and moves through
+  `PATCH /orders/{id}/status` or `POST /orders/{id}/cancel`. `OrderRequest` still has no
+  `status` field, so a client cannot pick the starting status.
 - **The transition matrix lives on `OrderStatus`, not in the service.** `NEW -> PAID ->
   SHIPPED` is the happy path; `NEW` and `PAID` may go to `CANCELLED` instead; `SHIPPED`
   and `CANCELLED` are terminal. `OrderService.updateStatus` only enforces what
@@ -149,6 +159,42 @@ One resource so far:
   deliberately **no self-edges** — `canTransitionTo(same)` is `false` for every status — so
   the current status never appears in the `allowed: [...]` list a 409 prints. Adding
   self-edges to `ALLOWED` would get the idempotency "for free" and corrupt those messages.
+- **`OrderService.cancel` is the only path to `CANCELLED`.** `updateStatus` opens with
+  `if (target == CANCELLED) return cancel(id, null);`, before its own no-op and before the
+  matrix check. Without that delegation `PATCH {"status":"CANCELLED"}` was a cheaper route
+  that stamped no `cancelledAt`, never refunded, and left the order in a state `cancel`
+  then treated as already-cancelled — making the refund permanently unreachable. The matrix
+  still carries the `NEW/PAID -> CANCELLED` edges; don't "fix" this by rejecting `CANCELLED`
+  on PATCH, which would break both those edges and the idempotent `CANCELLED -> CANCELLED`
+  200.
+- **`cancel` flushes before it refunds, and refunds inside the transaction.** Both halves are
+  load-bearing and neither is an accident:
+  - `saveAndFlush` first means the versioned `update ... where id = ? and version = ?` holds
+    the row lock until commit, so a concurrent cancel blocks, fails its own version check,
+    and gets a 409 **without ever reaching `refund`**. Refunding first would let two
+    requests pay out before either wrote.
+  - The refund stays inside `@Transactional` because the rule is that a failed refund leaves
+    the order `PAID`, and the rollback is what delivers it. The cost is a row lock held for
+    the duration of an external call; an outbox is the real fix, not reordering those lines.
+  - Known gap: nothing deduplicates a **sequential** retry. If the refund succeeds but the
+    commit fails, the order stays `PAID` and a retry refunds again. Closing it needs an
+    idempotency key on `PaymentClient.refund`.
+- **A second cancel is a write-free 200.** The already-`CANCELLED` early return precedes
+  every setter, so no `UPDATE` is issued, no second refund happens, and a `cancellationReason`
+  set earlier is never nulled out by a later reason-less PATCH.
+- **`OrderResponse` components are appended, never reordered.** Tests and helpers build the
+  record positionally, so inserting a component in the middle silently shifts every caller.
+- **`FakePaymentClient` is a no-op behind `@ConditionalOnMissingBean`.** It is registered
+  from `PaymentClientConfiguration`, not annotated `@Component`, so a real client replaces it
+  instead of failing startup with `NoUniqueBeanDefinitionException` (the condition is only
+  reliable on a `@Bean` method). It logs at **warn** and always reports success, so in a
+  running app every `PAID` cancellation is cancelled-but-not-refunded, and the 502 branch is
+  reachable only through a mocked `PaymentClient`.
+- **Nothing here is authenticated.** `POST /orders/{id}/cancel` takes the id straight from
+  the path with no principal and no ownership check, and that path moves money. Harmless
+  only because the sole `PaymentClient` is a no-op — swapping in a real provider needs
+  `spring-boot-starter-security` (plus its `-test` starter) and a check against
+  `order.getCustomerEmail()` in the same change.
 - **Email lookup is case-insensitive** (`findByCustomerEmailIgnoreCase`) because email
   domains are; values are stored exactly as submitted and only the lookup folds case.
 - **`@Valid` on the controller parameter is what activates the DTO constraints.** Without
@@ -158,6 +204,11 @@ One resource so far:
   which misbehaves for unsaved entities and in collections.
 - **`OrderNotFoundException` is a plain `RuntimeException`**, not a `ResponseStatusException`,
   so the service layer carries no HTTP concerns. `ApiExceptionHandler` maps it to 404.
+  `RefundFailedException` follows the same shape, and being unchecked is also what triggers
+  the rollback the 502 depends on.
+- **The advice class is `ApiExceptionHandler`, and exceptions extend `RuntimeException`
+  directly.** There is no `GlobalExceptionHandler` and no `BusinessException` in this repo;
+  a stale note once claimed otherwise. Don't rename or introduce them on that basis.
 - **Money is `BigDecimal`**, never `double`. The column is `precision = 19, scale = 2` and
   `OrderRequest` carries a matching `@Digits(integer = 17, fraction = 2)` so the API rejects
   what the database would otherwise truncate.
@@ -174,6 +225,10 @@ One resource so far:
      "errors":{"amount":"must be greater than 0","customerEmail":"must be a well-formed email address"}}
 400 {"status":400,"title":"Malformed request",
      "detail":"Request body is missing or not valid JSON for this endpoint"}
+409 {"status":409,"title":"Concurrent modification",
+     "detail":"The order was modified concurrently; retry the request"}
+502 {"status":502,"title":"Refund failed",
+     "detail":"Refund for order 1 failed; the order is unchanged"}
 ```
 
 Spring already answers 400 for a failed `@Valid` without the handler — what the handler adds
@@ -187,7 +242,18 @@ because an unparseable body never reaches `@Valid`, so **an unknown enum name su
 `{"status":"BOGUS"}` would otherwise answer 400 with a completely empty body** — verified
 before the handler existed. Its detail is deliberately generic: Jackson's own message names
 internal classes and echoes the rejected value. Note this handler also covers malformed
-JSON on `POST /orders`.
+JSON on `POST /orders` and on `POST /orders/{id}/cancel`.
+
+The 409 handler catches **`ConcurrencyFailureException`**, not just
+`OptimisticLockingFailureException`. That breadth is deliberate: while `cancel` holds the row
+lock across the refund call, a racing request can hit H2's lock timeout first, which arrives
+as `CannotAcquireLockException` — a *pessimistic* failure. Narrowing this handler sends that
+race to a bare 500 instead of the 409 it deserves.
+
+Both new handlers **log** (`log.error` for a refund failure, `log.warn` for a concurrency
+loss) because the `PaymentException` cause carries the provider's real error and reaches the
+client in no form at all; a production 502 would otherwise be undiagnosable. The response
+bodies deliberately say nothing extra.
 
 ### Persistence
 
@@ -200,19 +266,31 @@ migration tool and revisiting `ddl-auto` first.
 `spring.jpa.open-in-view` is set to `false`; leave it that way, or queries start firing
 during view rendering.
 
+`Order.version` (`@Version`, `@Column(nullable = false)`) is what makes the anti-double-refund
+ordering in `cancel` work. Harmless under `create-drop`, but a migration tool arriving later
+must add the column `NOT NULL DEFAULT 0` and backfill existing rows: Hibernate reads a `NULL`
+version as a transient entity.
+
 No profiles are defined — startup reports `No active profile set`.
 
 ## Testing
 
-57 tests in five classes, layered deliberately:
+96 tests in seven classes, layered deliberately:
 
 | Class | Scope |
 | --- | --- |
 | `entity/OrderStatusTest` | plain JUnit, no Spring — the transition matrix, parameterized |
+| `service/OrderServiceTest` | plain JUnit + Mockito, no Spring — cancellation rules, and an `InOrder` pinning flush-before-refund |
 | `controller/OrderControllerTest` | `@WebMvcTest` + `@MockitoBean OrderService` — status codes, headers, validation |
-| `repository/OrderRepositoryTest` | `@DataJpaTest` against real H2 — derived query, timestamps, scale |
+| `repository/OrderRepositoryTest` | `@DataJpaTest` against real H2 — derived query, timestamps, scale, `@Version`, cancellation round trip |
 | `OrderApiIntegrationTest` | `@SpringBootTest` + `@AutoConfigureMockMvc`, `@Transactional` — controller through to H2 |
+| `OrderCancelIntegrationTest` | same slice **plus `@MockitoBean PaymentClient`** — cancellation end to end, including the 502 rollback |
 | `OrderServiceApplicationTests` | `contextLoads` smoke test |
+
+`OrderCancelIntegrationTest` is a separate class rather than more methods on
+`OrderApiIntegrationTest` because `@MockitoBean PaymentClient` changes the context cache key;
+merging them would rebuild the context for every existing test and let a stubbed client leak
+into tests that assume the real one.
 
 Conventions that are intentional:
 
@@ -231,9 +309,25 @@ Conventions that are intentional:
   `read` is generic (`<T> T`), so `String.valueOf(JsonPath.read(...))` infers `T` as
   `char[]` to match an overload and fails at runtime with
   `Integer cannot be cast to [C`. It compiles cleanly, which is what makes it nasty.
+- **A test that asserts something was *not* written must opt out of the test transaction**
+  (`@Transactional(propagation = Propagation.NOT_SUPPORTED)`, with its own cleanup). Inside
+  the class-level transaction the service merely joins it, so a throw only marks it
+  rollback-only and a follow-up `GET` reads the flushed value back out of the shared
+  persistence context. The 502-rollback tests in `OrderCancelIntegrationTest` would be
+  decided by the identity map rather than by rollback without it. Same trap, same shape: a
+  `@DataJpaTest` proving a column round-trips needs `entityManager.clear()` before reloading,
+  or it re-reads the managed instance and never touches the row.
+- **Comparing a `BigDecimal` argument uses `isEqualByComparingTo`, not `eq(...)`/`isEqualTo`** —
+  `BigDecimal.equals` is scale-sensitive, so `42.5` and `42.50` are unequal. Capture the
+  argument and compare numerically.
+- **An `Instant` asserted for exact equality is stored `truncatedTo(MICROS)`** — H2 maps
+  `Instant` to `TIMESTAMP(6)` while `Instant.now()` carries nanoseconds, so an untruncated
+  value comes back trimmed and the assertion fails for a reason that has nothing to do with
+  the code under test.
 
 ## Repo
 
-Single `main` branch, pushed to `origin` at https://github.com/stefanbanu/order-service
-(public). Note the typo in the first commit message ("Sptring"); fixing it now needs an
-interactive rebase rather than an amend.
+`main`, pushed to `origin` at https://github.com/stefanbanu/order-service (public), plus the
+unpushed `feature/cancel-order`. Note the typo in the first commit message ("Sptring");
+fixing it now needs an interactive rebase rather than an amend.
+
