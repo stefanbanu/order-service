@@ -1,3 +1,9 @@
 spring:
   application:
     name: order-service
+  jpa:
+    # Avoids queries firing during view rendering, and silences the startup warning.
+    open-in-view: false
+    hibernate:
+      # Already the default for an embedded datasource; explicit now that real tables exist.
+      ddl-auto: create-drop
