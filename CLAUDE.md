@@ -7,9 +7,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 All verified working on this machine (Java 25, `mvnw` → Maven 3.10.0).
 
 ```bash
-./mvnw test                                          # run all tests
-./mvnw test -Dtest='OrderServiceApplicationTests'    # single test class
+./mvnw test                                          # run all tests (26)
+./mvnw test -Dtest='OrderControllerTest'             # single test class
 ./mvnw test -Dtest='ClassName#methodName'            # single test method
+./mvnw test -Dtest='Order*Test'                      # pattern
 ./mvnw spring-boot:run                               # run app → Tomcat on :8080
 ./mvnw package                                       # build executable jar in target/
 ./mvnw spring-boot:build-image                       # OCI image via Paketo buildpacks
@@ -50,9 +51,32 @@ Note there are **three separate `-test` starters**, one per slice, rather than o
 `spring-boot-starter-test`. When adding a new capability, add both its starter and its
 matching `-test` starter. Renaming any of these to the Boot 3 form breaks the build.
 
-Boot 4 also moved some classes: Tomcat's web server now logs from
-`org.springframework.boot.tomcat.TomcatWebServer`, not `org.springframework.boot.web.embedded.tomcat`.
-Verify import paths against the 4.1.1 docs rather than from memory.
+## Boot 4 relocations and replacements
+
+Every row below was verified against the resolved classpath. Reaching for the familiar name
+gives a compile error, or silently nothing:
+
+| Familiar (Boot 3 / Spring 6) | What this project has |
+| --- | --- |
+| `...boot.test.autoconfigure.web.servlet.WebMvcTest` | `org.springframework.boot.webmvc.test.autoconfigure.WebMvcTest` |
+| `...boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc` | `org.springframework.boot.webmvc.test.autoconfigure.AutoConfigureMockMvc` |
+| `...boot.test.autoconfigure.orm.jpa.DataJpaTest` | `org.springframework.boot.data.jpa.test.autoconfigure.DataJpaTest` |
+| `...boot.web.embedded.tomcat.TomcatWebServer` | `org.springframework.boot.tomcat.TomcatWebServer` |
+| `@MockBean` | **removed.** Use `@MockitoBean` (`org.springframework.test.context.bean.override.mockito`) |
+| `com.fasterxml.jackson.databind.ObjectMapper` | `tools.jackson.databind.ObjectMapper` — Boot 4 ships **Jackson 3** under the `tools.jackson` root; the `com.fasterxml` databind is not on the classpath at all |
+
+`@SpringBootTest` (`org.springframework.boot.test.context`) did *not* move. Jackson
+*annotations* also stay put at `com.fasterxml.jackson.annotation` (still 2.x) — only
+databind and core moved to `tools.jackson`. MockMvc is unchanged and still available, though
+Boot 4 also ships `RestTestClient` as an alternative.
+
+JUnit Jupiter is **6.0.3**, not 5.x; the usual `org.junit.jupiter.api` imports still apply.
+
+When in doubt, confirm a symbol exists before writing against it:
+
+```bash
+unzip -l ~/.m2/repository/org/springframework/spring-test/7.0.9/spring-test-7.0.9.jar | grep -i mockitobean
+```
 
 ## Lombok is wired through explicit annotationProcessorPaths
 
@@ -75,29 +99,110 @@ overrides the build would advertise Spring Boot's license and developers as this
 own. Leave them, or fill them in with real values — but don't just delete them. (The
 generated, gitignored `HELP.md` documents this under "Maven Parent overrides".)
 
-## Current state and architecture
+## Architecture
 
-This is a **bare Spring Boot skeleton**, not a partially-built service. The entire
-application is `OrderServiceApplication` (a `@SpringBootApplication` with a `main`) plus a
-`contextLoads` smoke test. `application.yaml` sets only `spring.application.name`.
+Package root `com.banu.orderservice` (groupId `com.banu`), organised **by layer**, not by
+feature:
 
-What that means in practice — none of these decisions have been made yet, so there is no
-existing convention to follow and no prior art to match:
+```
+controller/   OrderController          REST endpoints
+service/      OrderService             transactions, entity <-> DTO mapping
+repository/   OrderRepository          Spring Data JPA
+dto/          OrderRequest, OrderResponse
+entity/       Order, OrderStatus
+exception/    OrderNotFoundException, ApiExceptionHandler
+```
 
-- No entities, repositories, services, or controllers. Startup logs `Found 0 JPA repository interfaces`.
-- No schema management: no `schema.sql`/`data.sql`, no Flyway or Liquibase, and
-  `spring.jpa.hibernate.ddl-auto` is unset — Hibernate's default applies against H2.
-- No persistence beyond in-memory H2. There is no production datasource; H2 is the only
-  database, at `runtime` scope.
-- No API layer, so no versioning or error-handling scheme.
-- No profiles — startup reports `No active profile set`.
-- `spring.jpa.open-in-view` is unconfigured and warns at every startup. Set it explicitly
-  (almost certainly to `false`) when adding the first repository, which both silences the
-  warning and avoids queries during view rendering.
+One resource so far:
 
-Package root is `com.banu.orderservice` (groupId `com.banu`).
+| Endpoint | Behaviour |
+| --- | --- |
+| `POST /orders` | 201 + `Location: /orders/{id}`; 400 on invalid input |
+| `GET /orders/{id}` | 200, or 404 |
+| `GET /orders?email=` | 200; `email` is **optional** — omitted lists all orders |
+
+### Invariants worth preserving
+
+- **The table is `orders`, not `order`.** `ORDER` is a SQL reserved word; H2 rejects
+  `create table order (...)` with a syntax error. `@Table(name = "orders")` on the entity is
+  load-bearing — `OrderRepositoryTest` cannot even start a context without it.
+- **DTOs are the trust boundary.** `OrderRequest` has only `customerEmail` and `amount`; the
+  absence of `id`, `status` and `createdAt` is what makes them unsettable by a client.
+  Posting them is silently ignored (Jackson is lenient about unknown properties), covered by
+  tests in `OrderApiIntegrationTest`. Don't widen `OrderRequest` without re-reading those.
+- **`status` is server-set to `NEW`.** No transition endpoint exists yet, so `PAID`,
+  `SHIPPED` and `CANCELLED` are unreachable through the API. A
+  `PATCH /orders/{id}/status` carrying the transition rules is the natural next step.
+- **Email lookup is case-insensitive** (`findByCustomerEmailIgnoreCase`) because email
+  domains are; values are stored exactly as submitted and only the lookup folds case.
+- **`@Valid` on the controller parameter is what activates the DTO constraints.** Without
+  it they are silently inert and every payload is accepted.
+- **`Order` uses Lombok `@Getter @Setter @NoArgsConstructor`, deliberately not `@Data`** —
+  `@Data` would generate `equals`/`hashCode` over all fields including the generated `id`,
+  which misbehaves for unsaved entities and in collections.
+- **`OrderNotFoundException` is a plain `RuntimeException`**, not a `ResponseStatusException`,
+  so the service layer carries no HTTP concerns. `ApiExceptionHandler` maps it to 404.
+- **Money is `BigDecimal`**, never `double`. The column is `precision = 19, scale = 2` and
+  `OrderRequest` carries a matching `@Digits(integer = 17, fraction = 2)` so the API rejects
+  what the database would otherwise truncate.
+
+### Error responses
+
+`ApiExceptionHandler` (`@RestControllerAdvice`) returns RFC 7807 `ProblemDetail` bodies:
+
+```
+404 {"status":404,"title":"Order not found","detail":"No order with id 9999","instance":"/orders/9999"}
+400 {"status":400,"title":"Invalid request","detail":"Request validation failed",
+     "errors":{"amount":"must be greater than 0","customerEmail":"must be a well-formed email address"}}
+```
+
+Spring already answers 400 for a failed `@Valid` without the handler — what the handler adds
+is the `errors` map, and it reports **every** invalid field at once rather than the first.
+
+### Persistence
+
+H2 in-memory only; there is no production datasource. `ddl-auto: create-drop` (already the
+default for an embedded datasource, set explicitly in `application.yaml` now that real
+tables exist), so the schema is rebuilt per boot and **no data survives a restart**. No
+Flyway or Liquibase, no `schema.sql`/`data.sql`. Introducing a real database means adding a
+migration tool and revisiting `ddl-auto` first.
+
+`spring.jpa.open-in-view` is set to `false`; leave it that way, or queries start firing
+during view rendering.
+
+No profiles are defined — startup reports `No active profile set`.
+
+## Testing
+
+26 tests in four classes, layered deliberately:
+
+| Class | Scope |
+| --- | --- |
+| `controller/OrderControllerTest` | `@WebMvcTest` + `@MockitoBean OrderService` — status codes, headers, validation |
+| `repository/OrderRepositoryTest` | `@DataJpaTest` against real H2 — derived query, timestamps, scale |
+| `OrderApiIntegrationTest` | `@SpringBootTest` + `@AutoConfigureMockMvc`, `@Transactional` — controller through to H2 |
+| `OrderServiceApplicationTests` | `contextLoads` smoke test |
+
+Conventions that are intentional:
+
+- **Request bodies are plain JSON string literals, not serialised objects.** This keeps the
+  exact payload under test visible and avoids the Jackson 3 import change entirely.
+- **The cross-layer test lives at the package root** because it belongs to no single layer;
+  the slice tests mirror the main tree.
+- `OrderApiIntegrationTest` is `@Transactional` so each test rolls back and list-length
+  assertions stay independent of execution order.
+- When asserting on a `JsonPath.read(...)` result, **assign it to a typed local first**:
+
+  ```java
+  Number id = JsonPath.read(json, "$.id");   // then id.toString()
+  ```
+
+  `read` is generic (`<T> T`), so `String.valueOf(JsonPath.read(...))` infers `T` as
+  `char[]` to match an overload and fails at runtime with
+  `Integer cannot be cast to [C`. It compiles cleanly, which is what makes it nasty.
 
 ## Repo
 
 Single `main` branch, pushed to `origin` at https://github.com/stefanbanu/order-service
-(public). History is one commit.
+(public). Note the typo in the first commit message ("Sptring"); fixing it now needs an
+interactive rebase rather than an amend.
