@@ -2,6 +2,7 @@ package com.banu.orderservice.controller;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.BDDMockito.given;
@@ -14,11 +15,13 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
+import com.banu.orderservice.client.PaymentException;
 import com.banu.orderservice.dto.OrderRequest;
 import com.banu.orderservice.dto.OrderResponse;
 import com.banu.orderservice.entity.OrderStatus;
 import com.banu.orderservice.exception.InvalidStatusTransitionException;
 import com.banu.orderservice.exception.OrderNotFoundException;
+import com.banu.orderservice.exception.RefundFailedException;
 import com.banu.orderservice.service.OrderService;
 import java.math.BigDecimal;
 import java.time.Instant;
@@ -27,6 +30,8 @@ import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.webmvc.test.autoconfigure.WebMvcTest;
+import org.springframework.dao.CannotAcquireLockException;
+import org.springframework.dao.OptimisticLockingFailureException;
 import org.springframework.http.MediaType;
 import org.springframework.test.context.bean.override.mockito.MockitoBean;
 import org.springframework.test.web.servlet.MockMvc;
@@ -41,6 +46,7 @@ import org.springframework.test.web.servlet.MockMvc;
 class OrderControllerTest {
 
     private static final Instant CREATED_AT = Instant.parse("2026-10-12T10:00:00Z");
+    private static final Instant CANCELLED_AT = Instant.parse("2026-10-12T11:30:00Z");
 
     @Autowired
     private MockMvc mockMvc;
@@ -52,8 +58,19 @@ class OrderControllerTest {
         return response(id, email, amount, OrderStatus.NEW);
     }
 
+    /**
+     * The trailing cancelledAt/cancellationReason are null for every status but
+     * CANCELLED, which is what {@link #cancelled} is for. OrderResponse is
+     * constructed positionally here, so appending components to the record shows
+     * up as a compile error in exactly these two helpers.
+     */
     private static OrderResponse response(long id, String email, String amount, OrderStatus status) {
-        return new OrderResponse(id, email, new BigDecimal(amount), status, CREATED_AT);
+        return new OrderResponse(id, email, new BigDecimal(amount), status, CREATED_AT, null, null);
+    }
+
+    private static OrderResponse cancelled(long id, String email, String amount, String reason) {
+        return new OrderResponse(id, email, new BigDecimal(amount), OrderStatus.CANCELLED,
+                CREATED_AT, CANCELLED_AT, reason);
     }
 
     @Test
@@ -256,5 +273,157 @@ class OrderControllerTest {
                 .andExpect(jsonPath("$.title").value("Malformed request"));
 
         verifyNoInteractions(service);
+    }
+
+    @Test
+    void cancelReturns200WhenCalledWithNoRequestBodyAtAll() throws Exception {
+        given(service.cancel(eq(1L), isNull()))
+                .willReturn(cancelled(1L, "bob@example.com", "42.50", null));
+
+        mockMvc.perform(post("/orders/1/cancel"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.id").value(1))
+                .andExpect(jsonPath("$.status").value("CANCELLED"))
+                .andExpect(jsonPath("$.cancelledAt").exists());
+
+        verify(service).cancel(1L, null);
+    }
+
+    @Test
+    void cancelPassesTheSubmittedReasonToTheService() throws Exception {
+        given(service.cancel(eq(1L), eq("changed my mind")))
+                .willReturn(cancelled(1L, "bob@example.com", "42.50", "changed my mind"));
+
+        mockMvc.perform(post("/orders/1/cancel")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"reason\":\"changed my mind\"}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.status").value("CANCELLED"))
+                .andExpect(jsonPath("$.cancellationReason").value("changed my mind"));
+
+        verify(service).cancel(1L, "changed my mind");
+    }
+
+    @Test
+    void cancelRejectsAReasonLongerThanTheColumn() throws Exception {
+        String tooLong = "x".repeat(256);
+
+        mockMvc.perform(post("/orders/1/cancel")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"reason\":\"" + tooLong + "\"}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.status").value(400))
+                .andExpect(jsonPath("$.title").value("Invalid request"))
+                .andExpect(jsonPath("$.errors.reason").exists());
+
+        verifyNoInteractions(service);
+    }
+
+    @Test
+    void cancelAcceptsAReasonOfExactlyTheColumnLength() throws Exception {
+        String atTheLimit = "x".repeat(255);
+        given(service.cancel(eq(1L), eq(atTheLimit)))
+                .willReturn(cancelled(1L, "bob@example.com", "42.50", atTheLimit));
+
+        mockMvc.perform(post("/orders/1/cancel")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"reason\":\"" + atTheLimit + "\"}"))
+                .andExpect(status().isOk());
+
+        verify(service).cancel(1L, atTheLimit);
+    }
+
+    @Test
+    void cancelReturns404WhenMissing() throws Exception {
+        given(service.cancel(eq(9999L), any())).willThrow(new OrderNotFoundException(9999L));
+
+        mockMvc.perform(post("/orders/9999/cancel"))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.status").value(404))
+                .andExpect(jsonPath("$.title").value("Order not found"))
+                .andExpect(jsonPath("$.detail").value("No order with id 9999"));
+    }
+
+    @Test
+    void cancelReturns409WhenTheOrderCannotBeCancelled() throws Exception {
+        given(service.cancel(anyLong(), any())).willThrow(
+                new InvalidStatusTransitionException(1L, OrderStatus.SHIPPED, OrderStatus.CANCELLED));
+
+        mockMvc.perform(post("/orders/1/cancel"))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.status").value(409))
+                .andExpect(jsonPath("$.title").value("Invalid status transition"))
+                .andExpect(jsonPath("$.detail").value(
+                        "Order 1 is SHIPPED, which is final; it cannot become CANCELLED"));
+    }
+
+    /**
+     * The handler catches the common supertype ConcurrencyFailureException, so
+     * both of the ways a concurrent cancel can fail have to answer the same 409:
+     * the version check below, and the H2 lock timeout in the next test.
+     */
+    @Test
+    void cancelReturns409WhenTheOptimisticLockIsLost() throws Exception {
+        given(service.cancel(anyLong(), any()))
+                .willThrow(new OptimisticLockingFailureException("Row was updated by another transaction"));
+
+        mockMvc.perform(post("/orders/1/cancel"))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.status").value(409))
+                .andExpect(jsonPath("$.title").value("Concurrent modification"))
+                .andExpect(jsonPath("$.detail").value(
+                        "The order was modified concurrently; retry the request"));
+    }
+
+    /**
+     * The lock-timeout half: the winning cancel holds the row for the whole
+     * refund call, so the loser's versioned UPDATE can time out and surface as a
+     * pessimistic CannotAcquireLockException instead of an optimistic failure.
+     * Both are ConcurrencyFailureException, which is why one handler covers them.
+     */
+    @Test
+    void cancelReturns409WhenTheRowLockCannotBeAcquired() throws Exception {
+        given(service.cancel(anyLong(), any()))
+                .willThrow(new CannotAcquireLockException("Timeout trying to lock table ORDERS"));
+
+        mockMvc.perform(post("/orders/1/cancel"))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.status").value(409))
+                .andExpect(jsonPath("$.title").value("Concurrent modification"))
+                .andExpect(jsonPath("$.detail").value(
+                        "The order was modified concurrently; retry the request"));
+    }
+
+    /**
+     * A body Jackson cannot parse never reaches @Valid, so without the
+     * HttpMessageNotReadableException handler this would be a 400 with an empty
+     * body. The cancel endpoint takes an optional body, which makes a truncated
+     * one the easy mistake to make against it.
+     */
+    @Test
+    void cancelReturns400ForAMalformedJsonBody() throws Exception {
+        mockMvc.perform(post("/orders/1/cancel")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"reason\":"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.status").value(400))
+                .andExpect(jsonPath("$.title").value("Malformed request"))
+                .andExpect(jsonPath("$.detail").value(
+                        "Request body is missing or not valid JSON for this endpoint"));
+
+        verifyNoInteractions(service);
+    }
+
+    @Test
+    void cancelReturns502WhenTheRefundFails() throws Exception {
+        given(service.cancel(anyLong(), any())).willThrow(
+                new RefundFailedException(1L, new PaymentException("provider unavailable")));
+
+        mockMvc.perform(post("/orders/1/cancel"))
+                .andExpect(status().isBadGateway())
+                .andExpect(jsonPath("$.status").value(502))
+                .andExpect(jsonPath("$.title").value("Refund failed"))
+                .andExpect(jsonPath("$.detail").value(
+                        "Refund for order 1 failed; the order is unchanged"));
     }
 }

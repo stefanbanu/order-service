@@ -8,6 +8,7 @@ import jakarta.persistence.GeneratedValue;
 import jakarta.persistence.GenerationType;
 import jakarta.persistence.Id;
 import jakarta.persistence.Table;
+import jakarta.persistence.Version;
 import java.math.BigDecimal;
 import java.time.Instant;
 import lombok.Getter;
@@ -43,4 +44,24 @@ public class Order {
     @CreationTimestamp
     @Column(nullable = false, updatable = false)
     private Instant createdAt;
+
+    /**
+     * Optimistic lock, not part of the API: OrderResponse never exposes it. Two
+     * concurrent cancels both read version n, the first flush writes n+1, and the
+     * second fails its version check — which is what stops a refund happening
+     * twice.
+     *
+     * <p>Not nullable: under {@code ddl-auto: create-drop} a NULL version is
+     * harmless, but once a migration tool arrives the column has to be added
+     * {@code NOT NULL DEFAULT 0} and existing rows backfilled, or Hibernate reads
+     * a NULL version as an unsaved (transient) entity and tries to INSERT it.
+     */
+    @Version
+    @Column(nullable = false)
+    private Long version;
+
+    private Instant cancelledAt;
+
+    @Column(length = 255)
+    private String cancellationReason;
 }

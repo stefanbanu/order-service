@@ -1,5 +1,6 @@
 package com.banu.orderservice.controller;
 
+import com.banu.orderservice.dto.CancelOrderRequest;
 import com.banu.orderservice.dto.OrderRequest;
 import com.banu.orderservice.dto.OrderResponse;
 import com.banu.orderservice.dto.OrderStatusUpdateRequest;
@@ -51,5 +52,20 @@ public class OrderController {
     public OrderResponse updateStatus(
             @PathVariable Long id, @Valid @RequestBody OrderStatusUpdateRequest request) {
         return service.updateStatus(id, request.status());
+    }
+
+    /**
+     * 200 with the cancelled order; 400 if the reason is longer than the @Size
+     * limit, 404 if unknown, 409 if it is already shipped or was cancelled
+     * concurrently, 502 if the refund failed.
+     *
+     * <p>{@code required = false} is what makes the body optional, so a bare
+     * POST with no reason works; @Valid still has to stay or the @Size on the
+     * reason never runs.
+     */
+    @PostMapping("/{id}/cancel")
+    public OrderResponse cancel(@PathVariable Long id,
+                                @Valid @RequestBody(required = false) CancelOrderRequest request) {
+        return service.cancel(id, request == null ? null : request.reason());
     }
 }
