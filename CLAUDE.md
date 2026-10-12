@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 All verified working on this machine (Java 25, `mvnw` → Maven 3.10.0).
 
 ```bash
-./mvnw test                                          # run all tests (54)
+./mvnw test                                          # run all tests (57)
 ./mvnw test -Dtest='OrderControllerTest'             # single test class
 ./mvnw test -Dtest='ClassName#methodName'            # single test method
 ./mvnw test -Dtest='Order*Test'                      # pattern
@@ -121,7 +121,7 @@ One resource so far:
 | `POST /orders` | 201 + `Location: /orders/{id}`; 400 on invalid input |
 | `GET /orders/{id}` | 200, or 404 |
 | `GET /orders?email=` | 200; `email` is **optional** — omitted lists all orders |
-| `PATCH /orders/{id}/status` | 200 + updated order; 404 if unknown, 409 if the transition is not allowed, 400 if the status is missing or not a known name |
+| `PATCH /orders/{id}/status` | 200 + updated order; 200 no-op if already in that status; 404 if unknown, 409 if the transition is not allowed, 400 if the status is missing or not a known name |
 
 ### Invariants worth preserving
 
@@ -140,9 +140,15 @@ One resource so far:
   and `CANCELLED` are terminal. `OrderService.updateStatus` only enforces what
   `canTransitionTo` says, which is why the matrix is testable without a Spring context
   (`entity/OrderStatusTest`).
-- **Self-transitions are refused**, so a repeated or retried `PATCH` answers 409 rather
-  than looking like it worked. Flip this in `OrderStatus.ALLOWED` if idempotent retries
-  matter more than detecting a double-send.
+- **A PATCH to the status an order already has is an idempotent 200**, returning the order
+  unchanged and issuing **no UPDATE** (verified against `show-sql`: the self-patch adds no
+  `update orders` statement). This holds for terminal statuses too, so `SHIPPED -> SHIPPED`
+  is 200 while `SHIPPED -> CANCELLED` is still 409. A client retrying after a timeout gets
+  the same answer the first attempt would have given.
+- **That no-op lives in `OrderService.updateStatus`, not in the matrix.** `OrderStatus` has
+  deliberately **no self-edges** — `canTransitionTo(same)` is `false` for every status — so
+  the current status never appears in the `allowed: [...]` list a 409 prints. Adding
+  self-edges to `ALLOWED` would get the idempotency "for free" and corrupt those messages.
 - **Email lookup is case-insensitive** (`findByCustomerEmailIgnoreCase`) because email
   domains are; values are stored exactly as submitted and only the lookup folds case.
 - **`@Valid` on the controller parameter is what activates the DTO constraints.** Without
@@ -198,7 +204,7 @@ No profiles are defined — startup reports `No active profile set`.
 
 ## Testing
 
-54 tests in five classes, layered deliberately:
+57 tests in five classes, layered deliberately:
 
 | Class | Scope |
 | --- | --- |

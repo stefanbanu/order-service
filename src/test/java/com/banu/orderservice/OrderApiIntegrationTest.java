@@ -175,11 +175,48 @@ class OrderApiIntegrationTest {
     }
 
     @Test
-    void refuses409OnARepeatedPatchSoRetriesAreNotSilentlyAccepted() throws Exception {
+    void repeatedPatchToTheSameStatusIsAnIdempotent200() throws Exception {
         String id = createOrder("{\"customerEmail\":\"bob@example.com\",\"amount\":10.00}");
         patchStatus(id, "PAID").andExpect(status().isOk());
 
-        patchStatus(id, "PAID").andExpect(status().isConflict());
+        patchStatus(id, "PAID")
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.status").value("PAID"));
+
+        mockMvc.perform(get("/orders/" + id)).andExpect(jsonPath("$.status").value("PAID"));
+    }
+
+    @Test
+    void patchToTheCurrentStatusIsIdempotentEvenWhenTerminal() throws Exception {
+        String id = createOrder("{\"customerEmail\":\"bob@example.com\",\"amount\":10.00}");
+        patchStatus(id, "CANCELLED").andExpect(status().isOk());
+
+        patchStatus(id, "CANCELLED")
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.status").value("CANCELLED"));
+    }
+
+    @Test
+    void patchToTheStartingStatusIsIdempotentWithoutAdvancingIt() throws Exception {
+        String id = createOrder("{\"customerEmail\":\"bob@example.com\",\"amount\":10.00}");
+
+        patchStatus(id, "NEW")
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.status").value("NEW"));
+
+        mockMvc.perform(get("/orders/" + id)).andExpect(jsonPath("$.status").value("NEW"));
+    }
+
+    @Test
+    void aTerminalStatusStillRefusesADifferentTarget() throws Exception {
+        String id = createOrder("{\"customerEmail\":\"bob@example.com\",\"amount\":10.00}");
+        patchStatus(id, "PAID").andExpect(status().isOk());
+        patchStatus(id, "SHIPPED").andExpect(status().isOk());
+
+        patchStatus(id, "CANCELLED")
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.detail").value(
+                        "Order " + id + " is SHIPPED, which is final; it cannot become CANCELLED"));
     }
 
     @Test

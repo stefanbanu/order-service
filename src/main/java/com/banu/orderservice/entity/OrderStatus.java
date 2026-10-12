@@ -10,9 +10,12 @@ import java.util.Set;
  * orchestrator and the matrix is testable without a Spring context.
  *
  * <p>{@code NEW -> PAID -> SHIPPED} is the happy path, and NEW or PAID may be
- * CANCELLED instead. SHIPPED and CANCELLED are terminal. A status cannot
- * transition to itself, so a repeated PATCH is reported rather than silently
- * accepted.
+ * CANCELLED instead. SHIPPED and CANCELLED are terminal.
+ *
+ * <p>There are deliberately no self-edges: a status is not a transition to
+ * itself. OrderService treats that case as an idempotent no-op before it
+ * consults this matrix, which keeps the current status out of the "allowed"
+ * list that refusal messages print.
  */
 public enum OrderStatus {
     NEW,

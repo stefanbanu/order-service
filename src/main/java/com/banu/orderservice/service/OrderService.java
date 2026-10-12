@@ -41,11 +41,20 @@ public class OrderService {
      * The transition matrix lives on {@link OrderStatus}; this only enforces it.
      * A disallowed move throws rather than quietly leaving the status alone, so a
      * client that PATCHes a shipped order learns nothing happened.
+     *
+     * <p>Asking for the status an order already has is idempotent: it returns the
+     * order unchanged, with no write, so a client retrying after a timeout gets
+     * the same 200 the first attempt would have. That is handled here rather than
+     * by giving OrderStatus self-edges, which would put the current status into
+     * the "allowed" list of every refusal message.
      */
     @Transactional
     public OrderResponse updateStatus(Long id, OrderStatus target) {
         Order order = repository.findById(id)
                 .orElseThrow(() -> new OrderNotFoundException(id));
+        if (order.getStatus() == target) {
+            return OrderResponse.from(order);
+        }
         if (!order.getStatus().canTransitionTo(target)) {
             throw new InvalidStatusTransitionException(id, order.getStatus(), target);
         }

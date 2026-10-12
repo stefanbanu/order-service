@@ -33,9 +33,14 @@ class OrderStatusTest {
         assertThat(from.canTransitionTo(to)).isFalse();
     }
 
+    /**
+     * No self-edges by design. The idempotent no-op for a PATCH to the current
+     * status is OrderService's job, so it stays out of the allowed-transition
+     * lists that refusal messages print.
+     */
     @ParameterizedTest
     @EnumSource(OrderStatus.class)
-    void rejectsSelfTransitionForEveryStatus(OrderStatus status) {
+    void hasNoSelfEdgeForAnyStatus(OrderStatus status) {
         assertThat(status.canTransitionTo(status)).isFalse();
     }
 
