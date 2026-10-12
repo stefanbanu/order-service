@@ -5,6 +5,7 @@ import java.util.Map;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ProblemDetail;
 import org.springframework.http.ResponseEntity;
+import org.springframework.http.converter.HttpMessageNotReadableException;
 import org.springframework.validation.FieldError;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
@@ -17,6 +18,33 @@ public class ApiExceptionHandler {
     public ResponseEntity<ProblemDetail> onOrderNotFound(OrderNotFoundException ex) {
         ProblemDetail problem = ProblemDetail.forStatusAndDetail(HttpStatus.NOT_FOUND, ex.getMessage());
         problem.setTitle("Order not found");
+        return ResponseEntity.of(problem).build();
+    }
+
+    /**
+     * 409 rather than 400: the body is well formed and the order exists, so what
+     * failed is the order's current state, not the request.
+     */
+    @ExceptionHandler(InvalidStatusTransitionException.class)
+    public ResponseEntity<ProblemDetail> onInvalidStatusTransition(InvalidStatusTransitionException ex) {
+        ProblemDetail problem = ProblemDetail.forStatusAndDetail(HttpStatus.CONFLICT, ex.getMessage());
+        problem.setTitle("Invalid status transition");
+        return ResponseEntity.of(problem).build();
+    }
+
+    /**
+     * A body Jackson cannot parse never reaches @Valid, so Spring resolves it to
+     * a 400 with an empty body. An unknown enum name is the likeliest mistake
+     * against /orders/{id}/status, so it gets a ProblemDetail like every other
+     * error here. The detail stays generic on purpose: Jackson's own message
+     * names internal classes and the rejected value, neither of which belongs in
+     * a response.
+     */
+    @ExceptionHandler(HttpMessageNotReadableException.class)
+    public ResponseEntity<ProblemDetail> onUnreadableBody() {
+        ProblemDetail problem = ProblemDetail.forStatusAndDetail(
+                HttpStatus.BAD_REQUEST, "Request body is missing or not valid JSON for this endpoint");
+        problem.setTitle("Malformed request");
         return ResponseEntity.of(problem).build();
     }
 

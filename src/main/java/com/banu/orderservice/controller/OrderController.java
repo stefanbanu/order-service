@@ -2,12 +2,14 @@ package com.banu.orderservice.controller;
 
 import com.banu.orderservice.dto.OrderRequest;
 import com.banu.orderservice.dto.OrderResponse;
+import com.banu.orderservice.dto.OrderStatusUpdateRequest;
 import com.banu.orderservice.service.OrderService;
 import jakarta.validation.Valid;
 import java.net.URI;
 import java.util.List;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PatchMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
@@ -42,5 +44,12 @@ public class OrderController {
     @GetMapping
     public List<OrderResponse> findAll(@RequestParam(required = false) String email) {
         return service.findAll(email);
+    }
+
+    /** 200 with the updated order; 404 if unknown, 409 if the transition is not allowed. */
+    @PatchMapping("/{id}/status")
+    public OrderResponse updateStatus(
+            @PathVariable Long id, @Valid @RequestBody OrderStatusUpdateRequest request) {
+        return service.updateStatus(id, request.status());
     }
 }

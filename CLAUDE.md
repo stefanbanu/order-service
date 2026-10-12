@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 All verified working on this machine (Java 25, `mvnw` → Maven 3.10.0).
 
 ```bash
-./mvnw test                                          # run all tests (26)
+./mvnw test                                          # run all tests (54)
 ./mvnw test -Dtest='OrderControllerTest'             # single test class
 ./mvnw test -Dtest='ClassName#methodName'            # single test method
 ./mvnw test -Dtest='Order*Test'                      # pattern
@@ -108,9 +108,10 @@ feature:
 controller/   OrderController          REST endpoints
 service/      OrderService             transactions, entity <-> DTO mapping
 repository/   OrderRepository          Spring Data JPA
-dto/          OrderRequest, OrderResponse
-entity/       Order, OrderStatus
-exception/    OrderNotFoundException, ApiExceptionHandler
+dto/          OrderRequest, OrderResponse, OrderStatusUpdateRequest
+entity/       Order, OrderStatus (owns the transition matrix)
+exception/    OrderNotFoundException, InvalidStatusTransitionException,
+              ApiExceptionHandler
 ```
 
 One resource so far:
@@ -120,6 +121,7 @@ One resource so far:
 | `POST /orders` | 201 + `Location: /orders/{id}`; 400 on invalid input |
 | `GET /orders/{id}` | 200, or 404 |
 | `GET /orders?email=` | 200; `email` is **optional** — omitted lists all orders |
+| `PATCH /orders/{id}/status` | 200 + updated order; 404 if unknown, 409 if the transition is not allowed, 400 if the status is missing or not a known name |
 
 ### Invariants worth preserving
 
@@ -130,9 +132,17 @@ One resource so far:
   absence of `id`, `status` and `createdAt` is what makes them unsettable by a client.
   Posting them is silently ignored (Jackson is lenient about unknown properties), covered by
   tests in `OrderApiIntegrationTest`. Don't widen `OrderRequest` without re-reading those.
-- **`status` is server-set to `NEW`.** No transition endpoint exists yet, so `PAID`,
-  `SHIPPED` and `CANCELLED` are unreachable through the API. A
-  `PATCH /orders/{id}/status` carrying the transition rules is the natural next step.
+- **`status` is server-set to `NEW` at creation** and only moves through
+  `PATCH /orders/{id}/status`. `OrderRequest` still has no `status` field, so a client
+  cannot pick the starting status.
+- **The transition matrix lives on `OrderStatus`, not in the service.** `NEW -> PAID ->
+  SHIPPED` is the happy path; `NEW` and `PAID` may go to `CANCELLED` instead; `SHIPPED`
+  and `CANCELLED` are terminal. `OrderService.updateStatus` only enforces what
+  `canTransitionTo` says, which is why the matrix is testable without a Spring context
+  (`entity/OrderStatusTest`).
+- **Self-transitions are refused**, so a repeated or retried `PATCH` answers 409 rather
+  than looking like it worked. Flip this in `OrderStatus.ALLOWED` if idempotent retries
+  matter more than detecting a double-send.
 - **Email lookup is case-insensitive** (`findByCustomerEmailIgnoreCase`) because email
   domains are; values are stored exactly as submitted and only the lookup folds case.
 - **`@Valid` on the controller parameter is what activates the DTO constraints.** Without
@@ -152,12 +162,26 @@ One resource so far:
 
 ```
 404 {"status":404,"title":"Order not found","detail":"No order with id 9999","instance":"/orders/9999"}
+409 {"status":409,"title":"Invalid status transition",
+     "detail":"Order 1 is PAID and cannot become NEW; allowed: [SHIPPED, CANCELLED]"}
 400 {"status":400,"title":"Invalid request","detail":"Request validation failed",
      "errors":{"amount":"must be greater than 0","customerEmail":"must be a well-formed email address"}}
+400 {"status":400,"title":"Malformed request",
+     "detail":"Request body is missing or not valid JSON for this endpoint"}
 ```
 
 Spring already answers 400 for a failed `@Valid` without the handler — what the handler adds
 is the `errors` map, and it reports **every** invalid field at once rather than the first.
+
+A refused transition is **409, not 400**: the body parsed and the order exists, so what
+conflicts is the order's current state rather than the request.
+
+The `Malformed request` row is the `HttpMessageNotReadableException` handler. It matters
+because an unparseable body never reaches `@Valid`, so **an unknown enum name such as
+`{"status":"BOGUS"}` would otherwise answer 400 with a completely empty body** — verified
+before the handler existed. Its detail is deliberately generic: Jackson's own message names
+internal classes and echoes the rejected value. Note this handler also covers malformed
+JSON on `POST /orders`.
 
 ### Persistence
 
@@ -174,10 +198,11 @@ No profiles are defined — startup reports `No active profile set`.
 
 ## Testing
 
-26 tests in four classes, layered deliberately:
+54 tests in five classes, layered deliberately:
 
 | Class | Scope |
 | --- | --- |
+| `entity/OrderStatusTest` | plain JUnit, no Spring — the transition matrix, parameterized |
 | `controller/OrderControllerTest` | `@WebMvcTest` + `@MockitoBean OrderService` — status codes, headers, validation |
 | `repository/OrderRepositoryTest` | `@DataJpaTest` against real H2 — derived query, timestamps, scale |
 | `OrderApiIntegrationTest` | `@SpringBootTest` + `@AutoConfigureMockMvc`, `@Transactional` — controller through to H2 |

@@ -6,7 +6,9 @@ import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.BDDMockito.given;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.patch;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.header;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
@@ -15,6 +17,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 import com.banu.orderservice.dto.OrderRequest;
 import com.banu.orderservice.dto.OrderResponse;
 import com.banu.orderservice.entity.OrderStatus;
+import com.banu.orderservice.exception.InvalidStatusTransitionException;
 import com.banu.orderservice.exception.OrderNotFoundException;
 import com.banu.orderservice.service.OrderService;
 import java.math.BigDecimal;
@@ -46,7 +49,11 @@ class OrderControllerTest {
     private OrderService service;
 
     private static OrderResponse response(long id, String email, String amount) {
-        return new OrderResponse(id, email, new BigDecimal(amount), OrderStatus.NEW, CREATED_AT);
+        return response(id, email, amount, OrderStatus.NEW);
+    }
+
+    private static OrderResponse response(long id, String email, String amount, OrderStatus status) {
+        return new OrderResponse(id, email, new BigDecimal(amount), status, CREATED_AT);
     }
 
     @Test
@@ -186,5 +193,68 @@ class OrderControllerTest {
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.length()").value(1))
                 .andExpect(jsonPath("$[0].customerEmail").value("bob@example.com"));
+    }
+
+    @Test
+    void updateStatusReturns200WithTheUpdatedOrder() throws Exception {
+        given(service.updateStatus(1L, OrderStatus.PAID))
+                .willReturn(response(1L, "bob@example.com", "42.50", OrderStatus.PAID));
+
+        mockMvc.perform(patch("/orders/1/status")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"status\":\"PAID\"}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.id").value(1))
+                .andExpect(jsonPath("$.status").value("PAID"));
+
+        verify(service).updateStatus(1L, OrderStatus.PAID);
+    }
+
+    @Test
+    void updateStatusReturns404WhenMissing() throws Exception {
+        given(service.updateStatus(9999L, OrderStatus.PAID))
+                .willThrow(new OrderNotFoundException(9999L));
+
+        mockMvc.perform(patch("/orders/9999/status")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"status\":\"PAID\"}"))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.title").value("Order not found"));
+    }
+
+    @Test
+    void updateStatusReturns409WhenTransitionNotAllowed() throws Exception {
+        given(service.updateStatus(1L, OrderStatus.PAID)).willThrow(
+                new InvalidStatusTransitionException(1L, OrderStatus.SHIPPED, OrderStatus.PAID));
+
+        mockMvc.perform(patch("/orders/1/status")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"status\":\"PAID\"}"))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.status").value(409))
+                .andExpect(jsonPath("$.title").value("Invalid status transition"))
+                .andExpect(jsonPath("$.detail").value(
+                        "Order 1 is SHIPPED, which is final; it cannot become PAID"));
+    }
+
+    @Test
+    void updateStatusRejectsMissingStatus() throws Exception {
+        mockMvc.perform(patch("/orders/1/status")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.errors.status").exists());
+    }
+
+    @Test
+    void updateStatusRejectsUnknownStatusWithoutReachingTheService() throws Exception {
+        mockMvc.perform(patch("/orders/1/status")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"status\":\"BOGUS\"}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.status").value(400))
+                .andExpect(jsonPath("$.title").value("Malformed request"));
+
+        verifyNoInteractions(service);
     }
 }
