@@ -117,11 +117,13 @@ entity/       Order, OrderStatus (owns the transition matrix)
 exception/    OrderNotFoundException, InvalidStatusTransitionException,
               RefundFailedException, ApiExceptionHandler
 client/       PaymentClient (outbound port), FakePaymentClient,
-              PaymentException, PaymentClientConfiguration
+              PaymentException
+config/       PaymentClientConfiguration — every `@Bean` method lives here
 ```
 
 `client/` is the one package that is not a layer: it holds an outbound port and its
-stand-in, not a tier of the request path.
+stand-in, not a tier of the request path. `config/` holds the `@Bean` definitions, so new
+beans go there rather than next to the type they build.
 
 One resource so far:
 

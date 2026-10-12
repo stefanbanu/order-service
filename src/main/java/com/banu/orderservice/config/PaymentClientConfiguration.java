@@ -1,5 +1,7 @@
-package com.banu.orderservice.client;
+package com.banu.orderservice.config;
 
+import com.banu.orderservice.client.FakePaymentClient;
+import com.banu.orderservice.client.PaymentClient;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
