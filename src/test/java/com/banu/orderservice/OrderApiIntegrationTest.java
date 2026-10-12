@@ -1,5 +1,6 @@
 package com.banu.orderservice;
 
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.patch;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
@@ -29,17 +30,20 @@ class OrderApiIntegrationTest {
     @Autowired
     private MockMvc mockMvc;
 
-    private String createOrder(String body) throws Exception {
-        String json = mockMvc.perform(post("/orders")
+    private String createOrderJson(String body) throws Exception {
+        return mockMvc.perform(post("/orders")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(body))
                 .andExpect(status().isCreated())
                 .andReturn()
                 .getResponse()
                 .getContentAsString();
+    }
+
+    private String createOrder(String body) throws Exception {
         // Typed local, not String.valueOf(JsonPath.read(...)): read() is generic,
         // so T would infer as char[] to match a String.valueOf overload and blow up.
-        Number id = JsonPath.read(json, "$.id");
+        Number id = JsonPath.read(createOrderJson(body), "$.id");
         return id.toString();
     }
 
@@ -138,18 +142,65 @@ class OrderApiIntegrationTest {
                 .andExpect(jsonPath("$.status").value("SHIPPED"));
     }
 
+    /**
+     * Deliberately patches to PAID rather than CANCELLED: a PATCH to CANCELLED
+     * delegates to the cancellation path, which legitimately stamps cancelledAt,
+     * so it is no longer the right target for a "nothing else moved" assertion.
+     * The CANCELLED side of that is
+     * {@link #patchToCancelledStampsCancelledAtAndLeavesTheRestAlone}.
+     */
     @Test
     void persistsTheNewStatusWithoutTouchingTheOtherFields() throws Exception {
-        String id = createOrder("{\"customerEmail\":\"bob@example.com\",\"amount\":42.50}");
+        String created = createOrderJson("{\"customerEmail\":\"bob@example.com\",\"amount\":42.50}");
+        Number idValue = JsonPath.read(created, "$.id");
+        String id = idValue.toString();
+        Object createdAt = JsonPath.read(created, "$.createdAt");
+        assertThat(createdAt).isNotNull();
 
-        patchStatus(id, "CANCELLED").andExpect(status().isOk());
+        patchStatus(id, "PAID").andExpect(status().isOk());
+
+        mockMvc.perform(get("/orders/" + id))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.status").value("PAID"))
+                .andExpect(jsonPath("$.customerEmail").value("bob@example.com"))
+                .andExpect(jsonPath("$.amount").value(42.50))
+                .andExpect(jsonPath("$.id").value(Integer.parseInt(id)))
+                .andExpect(jsonPath("$.createdAt").value(createdAt))
+                .andExpect(jsonPath("$.cancelledAt").isEmpty())
+                .andExpect(jsonPath("$.cancellationReason").isEmpty());
+    }
+
+    /**
+     * A PATCH to CANCELLED goes through OrderService.cancel, so it stamps
+     * cancelledAt as well as the status. It carries no reason, which is what
+     * keeps cancellationReason null here while POST /orders/{id}/cancel can set
+     * it. Everything else about the order still has to survive untouched; the
+     * refund half of this lives in OrderCancelIntegrationTest, where the payment
+     * port is mocked.
+     */
+    @Test
+    void patchToCancelledStampsCancelledAtAndLeavesTheRestAlone() throws Exception {
+        String created = createOrderJson("{\"customerEmail\":\"bob@example.com\",\"amount\":42.50}");
+        Number idValue = JsonPath.read(created, "$.id");
+        String id = idValue.toString();
+        Object createdAt = JsonPath.read(created, "$.createdAt");
+        assertThat(createdAt).isNotNull();
+
+        patchStatus(id, "CANCELLED")
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.status").value("CANCELLED"))
+                .andExpect(jsonPath("$.cancelledAt").exists())
+                .andExpect(jsonPath("$.cancellationReason").isEmpty());
 
         mockMvc.perform(get("/orders/" + id))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.status").value("CANCELLED"))
+                .andExpect(jsonPath("$.cancelledAt").exists())
+                .andExpect(jsonPath("$.cancellationReason").isEmpty())
                 .andExpect(jsonPath("$.customerEmail").value("bob@example.com"))
                 .andExpect(jsonPath("$.amount").value(42.50))
-                .andExpect(jsonPath("$.id").value(Integer.parseInt(id)));
+                .andExpect(jsonPath("$.id").value(Integer.parseInt(id)))
+                .andExpect(jsonPath("$.createdAt").value(createdAt));
     }
 
     @Test
@@ -186,14 +237,27 @@ class OrderApiIntegrationTest {
         mockMvc.perform(get("/orders/" + id)).andExpect(jsonPath("$.status").value("PAID"));
     }
 
+    /**
+     * The repeat patch reaches OrderService.cancel, whose already-CANCELLED early
+     * return is what keeps this a 200 with no second write: cancelledAt has to
+     * come back byte for byte, not be re-stamped.
+     */
     @Test
     void patchToTheCurrentStatusIsIdempotentEvenWhenTerminal() throws Exception {
         String id = createOrder("{\"customerEmail\":\"bob@example.com\",\"amount\":10.00}");
-        patchStatus(id, "CANCELLED").andExpect(status().isOk());
+        String first = patchStatus(id, "CANCELLED")
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.cancelledAt").exists())
+                .andReturn()
+                .getResponse()
+                .getContentAsString();
+        Object firstCancelledAt = JsonPath.read(first, "$.cancelledAt");
 
         patchStatus(id, "CANCELLED")
                 .andExpect(status().isOk())
-                .andExpect(jsonPath("$.status").value("CANCELLED"));
+                .andExpect(jsonPath("$.status").value("CANCELLED"))
+                .andExpect(jsonPath("$.cancelledAt").value(firstCancelledAt))
+                .andExpect(jsonPath("$.cancellationReason").isEmpty());
     }
 
     @Test
