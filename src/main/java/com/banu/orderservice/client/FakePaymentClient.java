@@ -29,7 +29,8 @@ public class FakePaymentClient implements PaymentClient {
     private static final Logger log = LoggerFactory.getLogger(FakePaymentClient.class);
 
     @Override
-    public void refund(Long orderId, BigDecimal amount) {
-        log.warn("NO-OP refund (no payment provider configured): {} for order {}", amount, orderId);
+    public void refund(Long orderId, BigDecimal amount, String idempotencyKey) {
+        log.warn("NO-OP refund (no payment provider configured): {} for order {}, idempotency key {}",
+                amount, orderId, idempotencyKey);
     }
 }

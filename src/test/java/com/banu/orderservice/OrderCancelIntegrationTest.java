@@ -2,6 +2,7 @@ package com.banu.orderservice;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.BDDMockito.willThrow;
 import static org.mockito.Mockito.times;
@@ -21,6 +22,7 @@ import com.banu.orderservice.repository.OrderRepository;
 import com.jayway.jsonpath.JsonPath;
 import java.math.BigDecimal;
 import java.time.Instant;
+import java.util.List;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
@@ -99,8 +101,24 @@ class OrderCancelIntegrationTest {
     /** Captures the refunded amount so it can be compared by value, not by scale. */
     private BigDecimal refundedAmountFor(String id) {
         ArgumentCaptor<BigDecimal> amount = ArgumentCaptor.forClass(BigDecimal.class);
-        verify(paymentClient, times(1)).refund(eq(Long.parseLong(id)), amount.capture());
+        verify(paymentClient, times(1)).refund(eq(Long.parseLong(id)), amount.capture(), anyString());
         return amount.getValue();
+    }
+
+    /** The idempotency key of the single refund, captured so its value can be asserted. */
+    private String refundKeyFor(String id) {
+        ArgumentCaptor<String> key = ArgumentCaptor.forClass(String.class);
+        verify(paymentClient, times(1))
+                .refund(eq(Long.parseLong(id)), any(BigDecimal.class), key.capture());
+        return key.getValue();
+    }
+
+    /** Every key the port was handed, in call order. */
+    private List<String> refundKeys(String id, int expectedCalls) {
+        ArgumentCaptor<String> keys = ArgumentCaptor.forClass(String.class);
+        verify(paymentClient, times(expectedCalls))
+                .refund(eq(Long.parseLong(id)), any(BigDecimal.class), keys.capture());
+        return keys.getAllValues();
     }
 
     private Order stored(String id) {
@@ -140,6 +158,11 @@ class OrderCancelIntegrationTest {
         // eq(new BigDecimal("42.50")) would be scale-sensitive: BigDecimal.equals
         // treats 42.5 and 42.50 as different, so compare by value instead.
         assertThat(refundedAmountFor(id)).isEqualByComparingTo("42.50");
+        // v0, not v1: inside the class-level test transaction the PATCH to PAID is
+        // a managed-entity write that is never flushed on its own, so the version
+        // is still the one the INSERT assigned when the cancel reads it. The
+        // cancel's own flush then writes version 1 — after the key was taken.
+        assertThat(refundKeyFor(id)).isEqualTo("order-" + id + "-v0");
     }
 
     @Test
@@ -153,7 +176,11 @@ class OrderCancelIntegrationTest {
                 .andExpect(jsonPath("$.status").value("CANCELLED"))
                 .andExpect(jsonPath("$.cancellationReason").value("first attempt"));
 
-        verify(paymentClient, times(1)).refund(eq(Long.parseLong(id)), any(BigDecimal.class));
+        // The committed cancel short-circuits the retry on the already-CANCELLED
+        // early return, so the port is never reached a second time at all — the
+        // key only has to dedupe retries of an attempt that rolled back.
+        verify(paymentClient, times(1))
+                .refund(eq(Long.parseLong(id)), any(BigDecimal.class), eq("order-" + id + "-v0"));
     }
 
     @Test
@@ -199,7 +226,7 @@ class OrderCancelIntegrationTest {
         String id = createOrder("{\"customerEmail\":\"bob@example.com\",\"amount\":42.50}");
         patchStatus(id, "PAID").andExpect(status().isOk());
         willThrow(new PaymentException("provider unavailable"))
-                .given(paymentClient).refund(any(Long.class), any(BigDecimal.class));
+                .given(paymentClient).refund(any(Long.class), any(BigDecimal.class), anyString());
 
         cancel(id, "changed my mind")
                 .andExpect(status().isBadGateway())
@@ -207,6 +234,58 @@ class OrderCancelIntegrationTest {
                 .andExpect(jsonPath("$.title").value("Refund failed"))
                 .andExpect(jsonPath("$.detail").value(
                         "Refund for order " + id + " failed; the order is unchanged"));
+
+        mockMvc.perform(get("/orders/" + id))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.status").value("PAID"))
+                .andExpect(jsonPath("$.cancelledAt").isEmpty())
+                .andExpect(jsonPath("$.cancellationReason").isEmpty());
+    }
+
+    /**
+     * What the idempotency key exists for: a sequential retry after a 502.
+     *
+     * <p>The provider may well have processed the first refund and simply failed
+     * to answer, so the rollback that leaves the order PAID is only half the
+     * safety — the retry refunds again, and nothing on this side can tell it not
+     * to. The protection is that both attempts carry the <em>same</em> key: the
+     * rolled-back attempt left the row at the version it was loaded at, so the
+     * retry reloads that version and reproduces the key, and the provider folds
+     * the two calls into one refund.
+     *
+     * <p>NOT_SUPPORTED for the same reason as its siblings: inside the shared test
+     * transaction the service would only mark it rollback-only, the flushed
+     * cancellation would stay in the persistence context, and the second attempt
+     * would read CANCELLED out of the identity map instead of reloading the
+     * still-PAID row — which is exactly the reload this test is about.
+     */
+    @Test
+    @Transactional(propagation = Propagation.NOT_SUPPORTED)
+    void aRetryAfterAFailedRefundSendsTheSameIdempotencyKey() throws Exception {
+        String id = createOrder("{\"customerEmail\":\"bob@example.com\",\"amount\":42.50}");
+        patchStatus(id, "PAID").andExpect(status().isOk());
+        willThrow(new PaymentException("response timed out"))
+                .given(paymentClient).refund(any(Long.class), any(BigDecimal.class), anyString());
+
+        cancel(id, "changed my mind")
+                .andExpect(status().isBadGateway())
+                .andExpect(jsonPath("$.status").value(502))
+                .andExpect(jsonPath("$.detail").value(
+                        "Refund for order " + id + " failed; the order is unchanged"));
+
+        cancel(id, "changed my mind")
+                .andExpect(status().isBadGateway())
+                .andExpect(jsonPath("$.status").value(502))
+                .andExpect(jsonPath("$.detail").value(
+                        "Refund for order " + id + " failed; the order is unchanged"));
+
+        List<String> keys = refundKeys(id, 2);
+        assertThat(keys.get(1))
+                .as("the retry must reproduce the first attempt's key so the provider dedupes it")
+                .isEqualTo(keys.get(0));
+        // The rollback left the row at the version the first attempt loaded, so
+        // that version — not a post-flush or per-attempt one — is in both keys.
+        assertThat(keys).containsExactly("order-" + id + "-v1", "order-" + id + "-v1");
 
         mockMvc.perform(get("/orders/" + id))
                 .andExpect(status().isOk())
@@ -235,7 +314,7 @@ class OrderCancelIntegrationTest {
         String id = createOrder("{\"customerEmail\":\"bob@example.com\",\"amount\":42.50}");
         patchStatus(id, "PAID").andExpect(status().isOk());
         willThrow(new PaymentException("provider unavailable"))
-                .given(paymentClient).refund(any(Long.class), any(BigDecimal.class));
+                .given(paymentClient).refund(any(Long.class), any(BigDecimal.class), anyString());
 
         patchStatus(id, "CANCELLED")
                 .andExpect(status().isBadGateway())
@@ -272,6 +351,10 @@ class OrderCancelIntegrationTest {
                 .andExpect(jsonPath("$.status").value("CANCELLED"))
                 .andExpect(jsonPath("$.cancelledAt").exists());
         assertThat(refundedAmountFor(id)).isEqualByComparingTo("42.50");
+        // The alias delegates to cancel(), so it carries a key of the same shape.
+        // v0 for the same reason as its POST sibling: the unflushed PATCH to PAID
+        // leaves the version at the one the INSERT assigned.
+        assertThat(refundKeyFor(id)).isEqualTo("order-" + id + "-v0");
     }
 
     /**

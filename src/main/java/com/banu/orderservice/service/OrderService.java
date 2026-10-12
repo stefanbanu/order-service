@@ -92,6 +92,19 @@ public class OrderService {
      * {@link #updateStatus} treats a self-patch: no write, and no second refund,
      * so a client retrying after a timeout is safe.
      *
+     * <p>A <em>sequential</em> retry — the refund went through but the commit
+     * failed, or the provider processed a refund whose response timed out and
+     * surfaced as a PaymentException, so the transaction rolled back and the order
+     * is still PAID — is deduplicated by the provider, through the idempotency key
+     * {@code "order-" + id + "-v" + version}. A rolled-back attempt leaves the row
+     * at the version it was loaded at, so the retry loads that same version and
+     * reproduces the same key, and the provider sees one refund rather than two.
+     * Had the cancellation instead committed, the retry short-circuits on the
+     * already-CANCELLED early return above and never refunds at all. The key is
+     * therefore read off the loaded entity <em>before</em> the flush below, which
+     * increments the in-memory version; using the post-flush version, a timestamp
+     * or a random UUID would mint a fresh key per attempt and refund twice.
+     *
      * <p>The ordering below is load-bearing. The save is flushed <em>before</em>
      * the refund because the flush issues
      * {@code update orders ... where id=? and version=?} and holds the row lock
@@ -120,13 +133,16 @@ public class OrderService {
         }
         boolean refundable = order.getStatus() == OrderStatus.PAID;
         BigDecimal amount = order.getAmount();
+        // Read before the flush: saveAndFlush increments the in-memory version,
+        // so taking it afterwards would give a retry a different key.
+        String idempotencyKey = "order-" + id + "-v" + order.getVersion();
         order.setStatus(OrderStatus.CANCELLED);
         order.setCancelledAt(Instant.now());
         order.setCancellationReason(reason);
         Order saved = repository.saveAndFlush(order);
         if (refundable) {
             try {
-                paymentClient.refund(id, amount);
+                paymentClient.refund(id, amount, idempotencyKey);
             } catch (RuntimeException ex) {
                 // Any failure out of the port is a refund failure: a real client
                 // throws RestClientException, ResourceAccessException or an NPE on a

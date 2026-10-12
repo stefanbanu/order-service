@@ -3,6 +3,7 @@ package com.banu.orderservice.service;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.BDDMockito.given;
 import static org.mockito.BDDMockito.willThrow;
@@ -64,9 +65,35 @@ class OrderServiceTest {
         return order;
     }
 
+    private static Order order(long id, OrderStatus status, String amount, long version) {
+        Order order = order(id, status, amount);
+        order.setVersion(version);
+        return order;
+    }
+
     /** saveAndFlush hands back whatever it was given, like a real flush of a managed entity. */
     private void savesWhatItIsGiven() {
         given(repository.saveAndFlush(any(Order.class))).willAnswer(call -> call.getArgument(0));
+    }
+
+    /**
+     * A flush as Hibernate performs it: the managed instance's @Version field is
+     * bumped in memory, and that same instance comes back. Stubbing it this way is
+     * what makes the pre-flush key assertion below able to fail.
+     */
+    private void flushBumpsTheVersion() {
+        given(repository.saveAndFlush(any(Order.class))).willAnswer(call -> {
+            Order flushed = call.getArgument(0);
+            flushed.setVersion(flushed.getVersion() + 1);
+            return flushed;
+        });
+    }
+
+    /** The one key the port was called with, captured rather than matched. */
+    private String capturedRefundKey(long id) {
+        ArgumentCaptor<String> key = ArgumentCaptor.forClass(String.class);
+        verify(paymentClient, times(1)).refund(eq(id), any(BigDecimal.class), key.capture());
+        return key.getValue();
     }
 
     @Test
@@ -111,8 +138,45 @@ class OrderServiceTest {
 
         assertThat(cancelled.status()).isEqualTo(OrderStatus.CANCELLED);
         ArgumentCaptor<BigDecimal> amount = ArgumentCaptor.forClass(BigDecimal.class);
-        verify(paymentClient, times(1)).refund(eq(7L), amount.capture());
+        verify(paymentClient, times(1)).refund(eq(7L), amount.capture(), eq("order-7-v0"));
         assertThat(amount.getValue()).isEqualByComparingTo("42.50");
+    }
+
+    /**
+     * The key is the whole point of the widened port: it is what lets the provider
+     * fold a sequential retry into one refund, so its exact value is asserted
+     * rather than matched with anyString(). The fixture carries an explicit
+     * version so "order-7-v3" is unambiguous.
+     */
+    @Test
+    void cancelOfAPaidOrderRefundsWithAnIdempotencyKeyOfItsIdAndVersion() {
+        Order stored = order(7L, OrderStatus.PAID, "42.50", 3L);
+        given(repository.findById(7L)).willReturn(Optional.of(stored));
+        savesWhatItIsGiven();
+
+        service.cancel(7L, "fraud");
+
+        assertThat(capturedRefundKey(7L)).isEqualTo("order-7-v3");
+    }
+
+    /**
+     * The key is read off the loaded entity <em>before</em> the flush, which
+     * increments the in-memory version. This is the assertion that fails if the
+     * derivation is ever moved below {@code saveAndFlush}: the flush here bumps 3
+     * to 4 exactly as Hibernate would, so a post-flush read would mint
+     * "order-7-v4" and a retry — which reloads the rolled-back row at version 3 —
+     * would send a different key and be refunded twice.
+     */
+    @Test
+    void cancelDerivesTheIdempotencyKeyFromThePreFlushVersion() {
+        Order stored = order(7L, OrderStatus.PAID, "42.50", 3L);
+        given(repository.findById(7L)).willReturn(Optional.of(stored));
+        flushBumpsTheVersion();
+
+        service.cancel(7L, "fraud");
+
+        assertThat(stored.getVersion()).as("the flush must really have bumped the version").isEqualTo(4L);
+        assertThat(capturedRefundKey(7L)).isEqualTo("order-7-v3");
     }
 
     /**
@@ -132,7 +196,7 @@ class OrderServiceTest {
 
         InOrder sequence = inOrder(repository, paymentClient);
         sequence.verify(repository).saveAndFlush(stored);
-        sequence.verify(paymentClient).refund(eq(7L), any(BigDecimal.class));
+        sequence.verify(paymentClient).refund(eq(7L), any(BigDecimal.class), eq("order-7-v0"));
         sequence.verifyNoMoreInteractions();
     }
 
@@ -189,7 +253,7 @@ class OrderServiceTest {
         given(repository.findById(7L)).willReturn(Optional.of(stored));
         savesWhatItIsGiven();
         PaymentException provider = new PaymentException("provider unavailable");
-        willThrow(provider).given(paymentClient).refund(eq(7L), any(BigDecimal.class));
+        willThrow(provider).given(paymentClient).refund(eq(7L), any(BigDecimal.class), anyString());
 
         assertThatThrownBy(() -> service.cancel(7L, "fraud"))
                 .isInstanceOf(RefundFailedException.class)
@@ -197,7 +261,7 @@ class OrderServiceTest {
                 .cause()
                 .isSameAs(provider);
 
-        verify(paymentClient, times(1)).refund(eq(7L), any(BigDecimal.class));
+        verify(paymentClient, times(1)).refund(eq(7L), any(BigDecimal.class), eq("order-7-v0"));
     }
 
     /**
@@ -219,9 +283,25 @@ class OrderServiceTest {
         // A PATCH carries no reason, so there is none to record.
         assertThat(cancelled.cancellationReason()).isNull();
         ArgumentCaptor<BigDecimal> amount = ArgumentCaptor.forClass(BigDecimal.class);
-        verify(paymentClient, times(1)).refund(eq(7L), amount.capture());
+        verify(paymentClient, times(1)).refund(eq(7L), amount.capture(), eq("order-7-v0"));
         assertThat(amount.getValue()).isEqualByComparingTo("42.50");
         verify(repository).saveAndFlush(stored);
+    }
+
+    /**
+     * The PATCH alias delegates to cancel(), so it must carry a key of the same
+     * shape rather than, say, no key at all: a retried PATCH has to dedupe exactly
+     * as a retried POST /cancel does.
+     */
+    @Test
+    void updateStatusToCancelledPassesTheSameIdempotencyKeyCancelWould() {
+        Order stored = order(7L, OrderStatus.PAID, "42.50", 3L);
+        given(repository.findById(7L)).willReturn(Optional.of(stored));
+        savesWhatItIsGiven();
+
+        service.updateStatus(7L, OrderStatus.CANCELLED);
+
+        assertThat(capturedRefundKey(7L)).isEqualTo("order-7-v3");
     }
 
     /**
@@ -259,7 +339,7 @@ class OrderServiceTest {
         given(repository.findById(7L)).willReturn(Optional.of(stored));
         savesWhatItIsGiven();
         IllegalStateException provider = new IllegalStateException("connect timeout");
-        willThrow(provider).given(paymentClient).refund(eq(7L), any(BigDecimal.class));
+        willThrow(provider).given(paymentClient).refund(eq(7L), any(BigDecimal.class), anyString());
 
         assertThatThrownBy(() -> service.cancel(7L, "fraud"))
                 .isInstanceOf(RefundFailedException.class)
@@ -267,7 +347,7 @@ class OrderServiceTest {
                 .cause()
                 .isSameAs(provider);
 
-        verify(paymentClient, times(1)).refund(eq(7L), any(BigDecimal.class));
+        verify(paymentClient, times(1)).refund(eq(7L), any(BigDecimal.class), eq("order-7-v0"));
     }
 
     /**

@@ -9,7 +9,7 @@ All verified working on this machine (Java 25, `mvnw` → Maven 3.10.0).
 - Compile only: ./mvnw compile
 
 ```bash
-./mvnw test                                          # run all tests (96)
+./mvnw test                                          # run all tests (100)
 ./mvnw test -Dtest='OrderControllerTest'             # single test class
 ./mvnw test -Dtest='ClassName#methodName'            # single test method
 ./mvnw test -Dtest='Order*Test'                      # pattern
@@ -178,9 +178,18 @@ One resource so far:
   - The refund stays inside `@Transactional` because the rule is that a failed refund leaves
     the order `PAID`, and the rollback is what delivers it. The cost is a row lock held for
     the duration of an external call; an outbox is the real fix, not reordering those lines.
-  - Known gap: nothing deduplicates a **sequential** retry. If the refund succeeds but the
-    commit fails, the order stays `PAID` and a retry refunds again. Closing it needs an
-    idempotency key on `PaymentClient.refund`.
+  - A **sequential** retry is deduplicated by the idempotency key, not by the ordering. If
+    the refund succeeds but the commit fails, the order stays `PAID` and the 502 invites a
+    retry — so `cancel` passes `PaymentClient.refund` a key of `order-{id}-v{version}`,
+    which the provider is contractually required to collapse into one refund.
+- **The idempotency key is read before the flush.** `saveAndFlush` increments the in-memory
+  version, so deriving the key afterwards would mint a different key per attempt and refund
+  twice — exactly what it exists to prevent. A rolled-back attempt leaves the row at the
+  version it was loaded at, so a retry reproduces the same key; a committed one short-circuits
+  on the already-`CANCELLED` early return and never refunds at all. A post-flush version, a
+  timestamp, or a random UUID all defeat it. `OrderServiceTest` pins this with a stub whose
+  `saveAndFlush` bumps the version the way Hibernate does, then asserts the key still carries
+  the pre-flush one.
 - **A second cancel is a write-free 200.** The already-`CANCELLED` early return precedes
   every setter, so no `UPDATE` is issued, no second refund happens, and a `cancellationReason`
   set earlier is never nulled out by a later reason-less PATCH.
@@ -277,7 +286,7 @@ No profiles are defined — startup reports `No active profile set`.
 
 ## Testing
 
-96 tests in seven classes, layered deliberately:
+100 tests in seven classes, layered deliberately:
 
 | Class | Scope |
 | --- | --- |
