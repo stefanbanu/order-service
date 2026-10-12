@@ -216,6 +216,42 @@ class OrderCancelIntegrationTest {
     }
 
     /**
+     * The same rollback through the PATCH alias, which is the path the delegation
+     * made money-moving: a PATCH to CANCELLED now routes through cancel(), so it
+     * can refund and therefore can 502. Covering only POST /cancel would leave the
+     * alias free to regress into committing a cancellation it never refunded.
+     *
+     * <p>NOT_SUPPORTED for the same reason as its POST sibling: inside the
+     * class-level test transaction the service merely joins it, so throwing only
+     * marks that transaction rollback-only and the flushed cancellation stays in
+     * the shared persistence context. The follow-up GET would then read CANCELLED
+     * out of the identity map and the assertion would be decided by that map
+     * rather than by rollback. With the test transaction off, each request commits
+     * or rolls back for real and @AfterEach removes the committed rows.
+     */
+    @Test
+    @Transactional(propagation = Propagation.NOT_SUPPORTED)
+    void aFailedRefundOnAPatchToCancelledRollsBackAndLeavesTheOrderPaid() throws Exception {
+        String id = createOrder("{\"customerEmail\":\"bob@example.com\",\"amount\":42.50}");
+        patchStatus(id, "PAID").andExpect(status().isOk());
+        willThrow(new PaymentException("provider unavailable"))
+                .given(paymentClient).refund(any(Long.class), any(BigDecimal.class));
+
+        patchStatus(id, "CANCELLED")
+                .andExpect(status().isBadGateway())
+                .andExpect(jsonPath("$.status").value(502))
+                .andExpect(jsonPath("$.title").value("Refund failed"))
+                .andExpect(jsonPath("$.detail").value(
+                        "Refund for order " + id + " failed; the order is unchanged"));
+
+        mockMvc.perform(get("/orders/" + id))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.status").value("PAID"))
+                .andExpect(jsonPath("$.cancelledAt").isEmpty())
+                .andExpect(jsonPath("$.cancellationReason").isEmpty());
+    }
+
+    /**
      * The regression test for the delegation: before OrderService.updateStatus
      * routed CANCELLED through cancel(), this PATCH moved a PAID order to
      * CANCELLED with no refund and no cancelledAt, and the second attempt hit the

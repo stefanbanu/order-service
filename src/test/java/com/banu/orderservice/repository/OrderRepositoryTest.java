@@ -6,6 +6,8 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import com.banu.orderservice.entity.Order;
 import com.banu.orderservice.entity.OrderStatus;
 import java.math.BigDecimal;
+import java.time.Instant;
+import java.time.temporal.ChronoUnit;
 import java.util.List;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -116,5 +118,44 @@ class OrderRepositoryTest {
 
         assertThatThrownBy(() -> repository.saveAndFlush(stale))
                 .isInstanceOf(OptimisticLockingFailureException.class);
+    }
+
+    /**
+     * The only test that proves the two cancellation columns reach H2 and come
+     * back. Every assertion in OrderCancelIntegrationTest runs inside one test
+     * transaction, so its follow-up GETs read the same managed instance out of the
+     * identity map and would pass even if neither column were mapped; the
+     * entityManager.clear() below is what forces a real SELECT.
+     *
+     * <p>The reason is exactly 255 characters — the width of
+     * {@code @Column(length = 255)} and the limit CancelOrderRequest's
+     * {@code @Size(max = 255)} allows — so the mapping is exercised at its
+     * boundary against H2 rather than assumed. A narrower column would fail here
+     * with a value-too-long error instead of passing quietly.
+     */
+    @Test
+    void roundTripsCancellationStatusTimestampAndReasonThroughTheDatabase() {
+        // Truncated to microseconds because H2 stores Instant as TIMESTAMP(6):
+        // Instant.now() carries nanosecond precision on this JVM, so an untruncated
+        // value would come back truncated and an exact match would be brittle.
+        // Storing an already-microsecond value keeps the assertion an exact equality.
+        Instant cancelledAt = Instant.now().truncatedTo(ChronoUnit.MICROS);
+        String reason = "x".repeat(255);
+        Order saved = persist("bob@example.com", "42.50");
+        Long id = saved.getId();
+
+        saved.setStatus(OrderStatus.CANCELLED);
+        saved.setCancelledAt(cancelledAt);
+        saved.setCancellationReason(reason);
+        repository.saveAndFlush(saved);
+        // Detach everything, so the reload below is a SELECT rather than a hit on
+        // the instance the persistence context already holds.
+        entityManager.clear();
+
+        Order reloaded = repository.findById(id).orElseThrow();
+
+        assertThat(reloaded.getStatus()).isEqualTo(OrderStatus.CANCELLED);
+        assertThat(reloaded.getCancelledAt()).isEqualTo(cancelledAt);
+        assertThat(reloaded.getCancellationReason()).isEqualTo(reason).hasSize(255);
     }
 }

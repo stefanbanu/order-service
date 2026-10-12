@@ -47,7 +47,19 @@ public class OrderController {
         return service.findAll(email);
     }
 
-    /** 200 with the updated order; 404 if unknown, 409 if the transition is not allowed. */
+    /**
+     * 200 with the updated order; 404 if unknown, 409 if the transition is not
+     * allowed or the order was modified concurrently, 502 if a refund failed.
+     *
+     * <p>{@code {"status":"CANCELLED"}} is an alias for POST /orders/{id}/cancel
+     * with no reason, so this endpoint refunds a PAID order — it can move money.
+     * Rejecting CANCELLED here instead would break the {@code NEW/PAID ->
+     * CANCELLED} edges of the matrix and the idempotent {@code CANCELLED ->
+     * CANCELLED} self-patch, so the contract is documented rather than narrowed.
+     *
+     * <p>A self-patch is still an idempotent 200 with no write, terminal statuses
+     * included, so no refund is issued for an already-cancelled order.
+     */
     @PatchMapping("/{id}/status")
     public OrderResponse updateStatus(
             @PathVariable Long id, @Valid @RequestBody OrderStatusUpdateRequest request) {
@@ -56,8 +68,11 @@ public class OrderController {
 
     /**
      * 200 with the cancelled order; 400 if the reason is longer than the @Size
-     * limit, 404 if unknown, 409 if it is already shipped or was cancelled
-     * concurrently, 502 if the refund failed.
+     * limit or the body is not valid JSON, 404 if unknown, 409 if the order is
+     * SHIPPED or was modified concurrently, 502 if the refund failed.
+     *
+     * <p>An order that is already CANCELLED answers 200 unchanged, with no write
+     * and no second refund, so a retry after a timeout is safe.
      *
      * <p>{@code required = false} is what makes the body optional, so a bare
      * POST with no reason works; @Valid still has to stay or the @Size on the

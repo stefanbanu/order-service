@@ -3,7 +3,6 @@ package com.banu.orderservice.client;
 import java.math.BigDecimal;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.stereotype.Component;
 
 /**
  * A stand-in until a real payment provider exists: it moves no money and always
@@ -14,13 +13,17 @@ import org.springframework.stereotype.Component;
  *
  * <p>The log line is a WARN that names itself a no-op: in a running app every
  * PAID cancellation is cancelled-but-not-refunded, and an INFO "Refunded ..."
- * would read like a real refund had happened. Registered unconditionally rather
- * than behind a profile because this project defines no profiles.
+ * would read like a real refund had happened.
+ *
+ * <p>Not a {@code @Component}: it is registered by
+ * {@link PaymentClientConfiguration} only when no other {@link PaymentClient}
+ * bean exists, so a real client replaces it instead of colliding with it. This
+ * project defines no profiles, so the fallback is conditional on the bean rather
+ * than on a profile.
  *
  * <p>Logs through SLF4J directly: Lombok is kept to the entity in this project,
  * so there is no {@code @Slf4j} here.
  */
-@Component
 public class FakePaymentClient implements PaymentClient {
 
     private static final Logger log = LoggerFactory.getLogger(FakePaymentClient.class);
