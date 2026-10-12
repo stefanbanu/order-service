@@ -12,6 +12,13 @@ public record OrderResponse(
         OrderStatus status,
         Instant createdAt) {
 
+    /**
+     * The single place an entity becomes a response, so what reaches the wire is
+     * decided by this record's components rather than by whatever fields Order
+     * later grows. Exists as a static factory to be usable as a method
+     * reference: OrderService maps both the single lookup and the list through
+     * {@code OrderResponse::from}.
+     */
     public static OrderResponse from(Order order) {
         return new OrderResponse(
                 order.getId(),
