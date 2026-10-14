@@ -24,17 +24,15 @@ Prefer `./mvnw` over the system `mvn` — the wrapper pins Maven 3.10.0 and uses
 `distributionType=only-script`, so it relies on a system Maven install for the binary but
 still controls the version.
 
-To reach the H2 console, it must be explicitly enabled — the `spring-boot-h2console`
-dependency alone leaves it off (`/h2-console` 404s):
+The H2 console is on: `application.yaml` sets `spring.h2.console.enabled: true`, so
+`/h2-console` answers as soon as the app starts. The `spring-boot-h2console` dependency
+alone would not be enough — without that property the path 404s.
 
-```bash
-./mvnw spring-boot:run -Dspring-boot.run.arguments=--spring.h2.console.enabled=true
-```
-
-The in-memory database name is a **fresh random UUID on every boot**
-(`jdbc:h2:mem:<uuid>`), logged at startup by `H2ConsoleAutoConfiguration`. Read the JDBC
-URL out of the log to connect; don't hardcode it. Set `spring.datasource.url` to a fixed
-value if you need a stable one.
+The database name is pinned to **`jdbc:h2:mem:orderdb`** (plus `DB_CLOSE_DELAY=-1`, which
+stops H2 discarding the database — schema and seeded rows included — whenever the pool
+drops to zero connections). Paste that URL into the console with user `sa` and an empty
+password; the login form prefills it. It used to be a fresh random UUID per boot that had
+to be read out of the startup log, which is no use when the point is to browse seeded data.
 
 ## Spring Boot 4 starter names — do not "correct" these
 
@@ -45,9 +43,16 @@ This project is on **Spring Boot 4.1.1**, which split the old umbrella starters 
 | ---------------------------------------- | --------------------------------- |
 | `spring-boot-starter-webmvc`             | `spring-boot-starter-web`         |
 | `spring-boot-h2console`                  | *(was part of devtools/web)*      |
+| `spring-boot-liquibase`                  | `org.liquibase:liquibase-core`    |
 | `spring-boot-starter-data-jpa-test`      | `spring-boot-starter-test`        |
 | `spring-boot-starter-validation-test`    | `spring-boot-starter-test`        |
 | `spring-boot-starter-webmvc-test`        | `spring-boot-starter-test`        |
+
+`spring-boot-liquibase` is the sharpest of these. A bare `org.liquibase:liquibase-core`
+compiles and resolves fine, but Boot 4 moved the auto-configurations into per-technology
+modules, so without this one there is no `LiquibaseAutoConfiguration`: the app starts
+happily, logs **nothing** about Liquibase, and leaves the database empty. This module
+brings `liquibase-core` transitively, so it is not declared separately.
 
 Note there are **three separate `-test` starters**, one per slice, rather than one
 `spring-boot-starter-test`. When adding a new capability, add both its starter and its
@@ -197,7 +202,7 @@ One resource so far:
     would bump the version, mint a fresh key on retry, and pay out twice — silently.
     `OrderServiceTest` pins this with a stub whose `saveAndFlush` bumps the version the way
     Hibernate does, then asserts the key is **unchanged** by it.
-  - **`id` alone is not enough.** Under `create-drop` with a per-boot database name,
+  - **`id` alone is not enough.** With a database rebuilt from the changelog on every boot,
     `IDENTITY` restarts at 1, so boot 2's order `1` would present the key boot 1's order `1`
     already burned, and a provider honouring the contract would replay that old success —
     moving no money and leaving a customer unpaid. The timestamp component is what rules that
@@ -281,19 +286,61 @@ bodies deliberately say nothing extra.
 
 ### Persistence
 
-H2 in-memory only; there is no production datasource. `ddl-auto: create-drop` (already the
-default for an embedded datasource, set explicitly in `application.yaml` now that real
-tables exist), so the schema is rebuilt per boot and **no data survives a restart**. No
-Flyway or Liquibase, no `schema.sql`/`data.sql`. Introducing a real database means adding a
-migration tool and revisiting `ddl-auto` first.
+H2 in-memory only; there is no production datasource. The database is still rebuilt from
+nothing on every boot and **no data survives a restart** — but the schema now comes from
+**Liquibase**, not from Hibernate. `ddl-auto` is `none`.
+
+```
+src/main/resources/db/changelog/
+  db.changelog-master.yaml           index: nothing but two includes
+  changes/001-create-orders-table.sql   create table orders
+  changes/002-insert-orders.sql         10 demo rows, contextFilter:seed
+```
+
+Things worth knowing before touching any of it:
+
+- **The schema is no longer generated from the entity.** Adding a field to `Order` means
+  writing a changeset for its column; nothing creates it for you, and `ddl-auto: none`
+  means the mismatch surfaces as a missing-column error at query time.
+- **`ddl-auto` is `none`, not `validate`.** `status` is a plain `varchar(16)` in the
+  changelog, while Hibernate's preferred type for an `@Enumerated` column on H2 is a native
+  `enum (...)`; `validate` reports that as a mismatch and refuses to start.
+- **The DDL/DML lives in `.sql` files; only the master index is YAML.** In Liquibase 5 OSS,
+  `include` *inside a formatted SQL changelog* is a paid feature — it fails startup asking
+  for a license key. include from YAML is free, hence the split. One formatted-SQL file
+  holding every changeset is the alternative, since a single file needs no include.
+- **In a formatted `.sql` changelog, a comment line whose first word is a directive keyword
+  is parsed as a directive.** A prose line starting `-- changeset ...` fails the build with
+  "Unexpected formatting in formatted changelog ... at line N". Mid-sentence is fine.
+- **The seed rows are tagged `contextFilter:seed`** and `application.yaml` activates that
+  context. `src/test/resources/application.yaml` activates `test` instead, which is how the
+  10 rows stay out of the tests. Deleting the `contexts` property would *not* exclude them:
+  with no runtime context set, Liquibase runs every changeset, tagged or not.
+- **The seed inserts deliberately omit `id`.** H2 does not advance a `generated by default
+  as identity` base when a value is supplied, so hardcoding ids 1–10 would leave the next
+  generated id at 1 and the first `POST /orders` would fail on a primary key violation.
+- **There is no check constraint on `status`, and re-adding one breaks the build.**
+  `check (status in ('NEW', ...))` looks right and reads back correctly from
+  `INFORMATION_SCHEMA`, but inside a `@DataJpaTest` slice every insert then fails with H2
+  error **23514** — the constraint could not be *evaluated* (not 23513, violated) — whose
+  swallowed cause is "The database has been closed [90098]". The stored expression goes
+  stale against that slice's embedded database; dropping and re-adding the identical
+  constraint at runtime makes the same insert succeed. It is fine in the app and under
+  `@SpringBootTest`, so the repository tests are the only place it shows. `OrderStatus` and
+  the transition matrix enforce the value set anyway.
+- **An applied changeset is never edited.** Liquibase checksums each one into
+  `DATABASECHANGELOG` and fails the next startup when one stops matching. Under this
+  in-memory database every boot starts empty, so that only bites once the datasource points
+  somewhere that persists.
 
 `spring.jpa.open-in-view` is set to `false`; leave it that way, or queries start firing
 during view rendering.
 
 `Order.version` (`@Version`, `@Column(nullable = false)`) is what makes the anti-double-refund
-ordering in `cancel` work. Harmless under `create-drop`, but a migration tool arriving later
-must add the column `NOT NULL DEFAULT 0` and backfill existing rows: Hibernate reads a `NULL`
-version as a transient entity.
+ordering in `cancel` work. `001-create-orders-table.sql` declares it `bigint default 0 not
+null` for that reason — Hibernate reads a `NULL` version as a transient entity and tries to
+INSERT it, so any future migration against existing rows has to backfill rather than add the
+column nullable.
 
 No profiles are defined — startup reports `No active profile set`.
 
@@ -315,6 +362,20 @@ No profiles are defined — startup reports `No active profile set`.
 `OrderApiIntegrationTest` because `@MockitoBean PaymentClient` changes the context cache key;
 merging them would rebuild the context for every existing test and let a stubbed client leak
 into tests that assume the real one.
+
+**Every Spring test runs against the Liquibase schema**, so a changelog that drifts from the
+entity now fails the suite rather than production. `src/test/resources/application.yaml` is
+what configures that, and it **replaces** `src/main/resources/application.yaml` rather than
+merging with it — Spring resolves `classpath:/application.yaml` to the first match and test
+resources come first, so anything the tests need is repeated there on purpose. Two absences
+in it are load-bearing:
+
+- **no `spring.datasource.url`**, so Boot generates a unique in-memory name per application
+  context. The main file pins `orderdb` for the console; reusing one fixed name here would
+  let the two `@SpringBootTest` contexts share a database.
+- **no `seed` context**, which is what keeps the 10 demo rows out. With them loaded,
+  `OrderApiIntegrationTest` alone breaks in three places (it expects 0, 1 and 2 rows), and
+  two of the seeded rows use `bob@example.com`, whom the repository tests also use.
 
 Conventions that are intentional:
 

@@ -1,0 +1,24 @@
+# Master changelog: an index, nothing more. Every statement this project runs lives in the
+# .sql files under changes/.
+#
+# Why this one file is YAML and not .sql: in Liquibase 5 OSS, `include` inside a formatted
+# SQL changelog is a paid feature -- it parses, then fails startup with "Using 'include in
+# Formatted SQL changelog' requires a valid Liquibase license key". include from a
+# YAML/XML/JSON changelog is free, so the index sits here and the SQL stays in .sql. Had
+# this needed to be SQL too, the way round it is one formatted-SQL file holding every
+# changeset, since a single file needs no include at all.
+#
+# This is also Boot's default changelog location; application.yaml names it explicitly
+# anyway, so the entry point is visible from the configuration.
+#
+# Paths are relative to the classpath root, not to this file.
+#
+# An applied changeset is never edited: Liquibase stores its checksum in DATABASECHANGELOG
+# and fails the next startup once it stops matching -- correct one by adding a new
+# changeset. Under this in-memory database every boot starts from nothing, so that only
+# begins to bite once the datasource points somewhere that persists.
+databaseChangeLog:
+  - include:
+      file: db/changelog/changes/001-create-orders-table.sql
+  - include:
+      file: db/changelog/changes/002-insert-orders.sql

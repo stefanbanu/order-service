@@ -1,0 +1,31 @@
+# Test configuration. This REPLACES src/main/resources/application.yaml rather than merging
+# with it: Spring resolves classpath:/application.yaml to the first match on the classpath,
+# and test resources come first. Anything the tests need has to be repeated here.
+#
+# Two things are deliberately absent:
+#
+#   * spring.datasource.url. The main file pins the database name so the H2 console can find
+#     it; here Boot's generated unique name per application context is what keeps the two
+#     @SpringBootTest contexts (OrderApiIntegrationTest and OrderCancelIntegrationTest) from
+#     sharing one database.
+#   * the "seed" Liquibase context. The 10 demo rows in changes/002-insert-orders.sql would
+#     break the count assertions in OrderApiIntegrationTest and OrderRepositoryTest, which
+#     expect to see only the orders the test itself created. "test" is not a context any
+#     changeset is tagged with -- it exists to be a non-empty value, because Liquibase runs
+#     every changeset, tagged or not, when no context at all is set.
+spring:
+  application:
+    name: order-service
+  liquibase:
+    change-log: classpath:/db/changelog/db.changelog-master.yaml
+    contexts: test
+  jpa:
+    open-in-view: false
+    hibernate:
+      # Same as the main file: the schema under test is the migrated one, so a changelog
+      # that drifts from the entity now fails the test suite rather than production.
+      ddl-auto: none
+
+logging:
+  level:
+    org.hibernate.orm.jdbc.bind: trace

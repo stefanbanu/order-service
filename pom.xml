@@ -30,6 +30,17 @@
         <java.version>25</java.version>
     </properties>
     <dependencies>
+        <!--
+          spring-boot-liquibase, NOT a bare org.liquibase:liquibase-core. Boot 4 moved the
+          auto-configurations out into per-technology modules, and liquibase-core on its own
+          carries no LiquibaseAutoConfiguration: the app then starts perfectly happily, logs
+          nothing about Liquibase, and leaves the database empty. This module brings
+          liquibase-core with it transitively.
+        -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-liquibase</artifactId>
+        </dependency>
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-h2console</artifactId>

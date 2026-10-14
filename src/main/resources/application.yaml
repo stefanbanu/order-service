@@ -1,9 +1,33 @@
 spring:
   application:
     name: order-service
+  datasource:
+    # A fixed database name rather than Boot's per-boot random UUID, so the JDBC URL to
+    # paste into /h2-console is predictable and does not have to be read out of the startup
+    # log. DB_CLOSE_DELAY=-1 keeps the in-memory database alive for the life of the JVM:
+    # without it H2 discards it -- schema, seeded rows and all -- as soon as the last
+    # connection closes, which the pool is free to do while the app sits idle.
+    url: jdbc:h2:mem:orderdb;DB_CLOSE_DELAY=-1;DB_CLOSE_ON_EXIT=FALSE
+    username: sa
+    password: ""
+  h2:
+    console:
+      # The spring-boot-h2console dependency on its own leaves the console switched off;
+      # /h2-console 404s without this.
+      enabled: true
+  liquibase:
+    # Already Boot's default location; named explicitly so the entry point into the
+    # changelogs is visible from the configuration. The master is a YAML index over the
+    # .sql files -- see the comment in it for why that one file cannot be .sql.
+    change-log: classpath:/db/changelog/db.changelog-master.yaml
+    # Activates the seed changeset (002), which is tagged contextFilter:seed. The tests
+    # deliberately do not activate it -- see src/test/resources/application.yaml.
+    contexts: seed
   jpa:
     # Avoids queries firing during view rendering, and silences the startup warning.
     open-in-view: false
     hibernate:
-      # Already the default for an embedded datasource; explicit now that real tables exist.
-      ddl-auto: create-drop
+      # Liquibase owns the schema now. Not `validate` either: the changelog declares status
+      # as a plain varchar(16), while Hibernate would describe its own preferred type (H2's
+      # native enum) for that column and report a mismatch.
+      ddl-auto: none
